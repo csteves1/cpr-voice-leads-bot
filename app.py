@@ -1,14 +1,11 @@
-import os, re
+import os, re, json, base64
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
 from intents import is_hours, is_location, is_phone, is_landmarks, is_directions
-from pricing import lookup_price
+from pricing import lookup_price, lookup_price_rows
 from repairq import get_inventory_by_sku, create_appointment
 from calls import start_outbound_call
-from pricing import lookup_price, lookup_price_rows
-
-# --- NEW ---
 from datetime import datetime
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
@@ -28,42 +25,67 @@ app = FastAPI()
 
 def say_and_listen(vr: VoiceResponse, text: str, action="/voice/inbound/process"):
     vr.say(text)
-    g = Gather(input="speech", action=action, method="POST", timeout=15, speech_timeout="auto", speech_model="phone_call",
-               hints="repair, screen, battery, iPhone, price, directions, appointment, hours, address, yes, no, morning, afternoon")
+    g = Gather(
+        input="speech",
+        action=action,
+        method="POST",
+        timeout=15,
+        speech_timeout="auto",
+        speech_model="phone_call",
+        hints="repair, screen, battery, iPhone, price, directions, appointment, hours, address, yes, no, morning, afternoon"
+    )
     vr.append(g)
     return vr
 
-# --- NEW: Save ticket to Google Sheets ---
+# --- Secure Google Sheets helpers ---
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+def get_sheets_credentials():
+    # Prefer base64 env var for security (no file needed on Render)
+    b64_creds = os.getenv("GOOGLE_SHEETS_CREDS_B64")
+    if b64_creds:
+        info = json.loads(base64.b64decode(b64_creds).decode("utf-8"))
+        return service_account.Credentials.from_service_account_info(info, scopes=SCOPES)
+    # Fallback: file path (local dev)
+    cred_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if cred_path and os.path.exists(cred_path):
+        return service_account.Credentials.from_service_account_file(cred_path, scopes=SCOPES)
+    raise RuntimeError("No Google Sheets credentials found.")
+
 def save_mock_ticket(data: dict):
-    creds = service_account.Credentials.from_service_account_file(
-        os.getenv("GOOGLE_APPLICATION_CREDENTIALS"),
-        scopes=["https://www.googleapis.com/auth/spreadsheets"]
-    )
-    sheet_id = os.getenv("MOCK_TICKETS_SHEET_ID")
-    service = build("sheets", "v4", credentials=creds)
-    values = [[
-        data.get("time_slot", ""),
-        data.get("first_name", ""),
-        data.get("last_name", ""),
-        data.get("phone", ""),
-        data.get("alt_phone", ""),
-        data.get("email", ""),
-        data.get("zip_code", ""),
-        data.get("referral", ""),
-        data.get("imei", ""),
-        data.get("device_model", ""),
-        data.get("passcode", ""),
-        data.get("diagnostic", ""),
-        datetime.now().isoformat()
-    ]]
-    body = {"values": values}
-    service.spreadsheets().values().append(
-        spreadsheetId=sheet_id,
-        range="Tickets!A:M",
-        valueInputOption="USER_ENTERED",
-        insertDataOption="INSERT_ROWS",
-        body=body
-    ).execute()
+    try:
+        creds = get_sheets_credentials()
+        sheet_id = os.getenv("MOCK_TICKETS_SHEET_ID")
+        if not sheet_id:
+            raise RuntimeError("MOCK_TICKETS_SHEET_ID not set")
+
+        service = build("sheets", "v4", credentials=creds)
+        values = [[
+            data.get("time_slot", ""),
+            data.get("first_name", ""),
+            data.get("last_name", ""),
+            data.get("phone", ""),
+            data.get("alt_phone", ""),
+            data.get("email", ""),
+            data.get("zip_code", ""),
+            data.get("referral", ""),
+            data.get("imei", ""),
+            data.get("device_model", ""),
+            data.get("passcode", ""),
+            data.get("diagnostic", ""),
+            datetime.now().isoformat()
+        ]]
+        body = {"values": values}
+        service.spreadsheets().values().append(
+            spreadsheetId=sheet_id,
+            range="Tickets!A:M",
+            valueInputOption="USER_ENTERED",
+            insertDataOption="INSERT_ROWS",
+            body=body
+        ).execute()
+        print("[Sheets] Ticket saved successfully")
+    except Exception as e:
+        print(f"[Sheets ERROR] {e}")
 
 @app.post("/voice/inbound/process")
 async def voice_process(req: Request):
@@ -246,14 +268,25 @@ async def lead_intake(
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
-
+    print(f"[Intake] time={time}, first_name={first_name}, last_name={last_name}, phone={phone}, alt_phone={alt_phone}, email={email}, zip_code={zip_code}, referral={referral}, imei={imei}, device_model={device_model}, passcode={passcode}, diagnostic={diagnostic}, answer={answer}")
+    
     def repeat_q(prompt, **kwargs):
+        print(f"[Prompting] {prompt} | next_params={kwargs}")
         params = "&".join([f"{k}={v}" for k, v in kwargs.items()])
-        return Response(str(say_and_listen(
-            VoiceResponse(), prompt,
-            action=f"/voice/outbound/lead/intake?{params}"
-        )), media_type="application/xml")
+        vrq = VoiceResponse()
+        vrq.say(prompt)
+        g = Gather(
+            input="speech",
+            action=f"/voice/outbound/lead/intake?{params}",
+            method="POST",
+            timeout=15,
+            speech_timeout="auto",
+            speech_model="phone_call"
+        )
+        vrq.append(g)
+        return Response(str(vrq), media_type="application/xml")
 
+    # Step-by-step checks
     if not first_name:
         if not answer:
             return repeat_q("What's your first name?", time=time)
@@ -291,7 +324,6 @@ async def lead_intake(
 
     if not imei:
         imei_value = "" if answer.lower() in ["no", "nah", "none"] else answer
-        # Optionally: IMEI API lookup here to auto-fill model
         return repeat_q("Do you have a passcode for the device? If not, say no.",
             time=time, first_name=first_name, last_name=last_name, phone=phone,
             alt_phone=alt_phone, email=email, zip_code=zip_code, referral=referral,
@@ -320,13 +352,21 @@ async def lead_intake(
             "passcode": passcode,
             "diagnostic": diagnostic_value
         }
-        save_mock_ticket(ticket)
-        vr = VoiceResponse()
-        vr.say(f"Thanks {first_name}, you're booked for the {time}. I've saved your ticket.")
-        vr.say("I can also answer general phone repair questions if you have any.")
-        vr.redirect("/voice/inbound")
-        return Response(str(vr), media_type="application/xml")
+        print(f"[Ticket Complete] {ticket}")
+        # Save ticket safely
+        try:
+            save_mock_ticket(ticket)
+            print("[Ticket saved to Google Sheets]")
+        except Exception as e:
+            print(f"[ERROR saving ticket] {e}")
 
+        vr_final = VoiceResponse()
+        vr_final.say(f"Thanks {first_name}, you're booked for the {time}. I've saved your ticket.")
+        vr_final.say("I can also answer general phone repair questions if you have any.")
+        vr_final.redirect("/voice/inbound")
+        return Response(str(vr_final), media_type="application/xml")
+
+    # If somehow we got here without matching a step, ask again
     return repeat_q("Sorry, I didn’t catch that. Could you repeat?", time=time)
 
 @app.get("/health")
