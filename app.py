@@ -11,8 +11,8 @@ STORE_INFO = {
     "name": "CPR Cell Phone Repair",
     "city": "Myrtle Beach",
     "address": "1000 South Commons Drive, Myrtle Beach, SC 29588",
-    "phone": "(843) 555-1234",
-    "hours": "Mon–Fri 9–6, Sat 10–4, Sun closed",
+    "phone": "(843) 750-0449",
+    "hours": "Monday to Saturday 9am-6pm, Sunday we are closed",
 }
 
 app = FastAPI()
@@ -58,22 +58,39 @@ async def voice_process(req: Request):
         return Response(str(say_and_listen(vr, "I can help with repairs, pricing, or booking. Is your question about a device or repair?")),
                         media_type="application/xml")
 
-    # LLM fallback (kept short, on-topic)
+# LLM fallback with Sheets lookup
     try:
         from openai import OpenAI
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+
+        # Try to detect a priceable repair from their words
+        detected = None
+        for row in lookup_price_rows():  # you'd add this helper to pricing.py to get all rows
+            if row['Device'].lower() in lower and row['RepairType'].lower() in lower:
+                detected = row
+                break
+
+        if detected:
+            vr.say(f"The current price for {detected['Device']} {detected['RepairType']} is ${detected['Price']}.")
+            return Response(str(vr), media_type="application/xml")
+
         system_prompt = f"""
-You are the receptionist for {STORE_INFO['name']} in {STORE_INFO['city']}.
-Stay strictly on store/services/repairs. Answer in 1–3 sentences. No tutorials. Offer to book if relevant.
-"""
-        msgs=[{"role":"system","content":system_prompt},{"role":"user","content":user_input}]
+        You are the receptionist for {STORE_INFO['name']} in {STORE_INFO['city']}.
+        Stay strictly on store/services/repairs. Keep answers to 1–3 sentences.
+        If asked for a price and you don't know it, say you'll check with a tech.
+        """
+        msgs = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_input}
+        ]
         out = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
         text = out.choices[0].message.content.strip()
         return Response(str(say_and_listen(vr, text)), media_type="application/xml")
+
     except Exception as e:
         return Response(str(say_and_listen(vr, "Sorry, I’m having trouble right now. Could you try again shortly?")),
                         media_type="application/xml")
-
+    
 @app.post("/webhooks/repairq/lead")
 async def repairq_lead(req: Request):
     payload = await req.json()
@@ -122,3 +139,21 @@ async def lead_process(req: Request):
 
 @app.get("/health")
 def health(): return {"ok": True}
+# Test‑only: get inventory for a given SKU
+@app.get("/dev/inventory/{sku}")
+def dev_inventory(sku: str):
+    try:
+        data = get_inventory_by_sku(sku)
+        return {"sku": sku, "inventory_data": data}
+    except Exception as e:
+        return {"error": str(e)}
+
+# Test‑only: book a dummy appointment in RepairQ
+@app.post("/dev/appointment")
+def dev_appointment():
+    try:
+        fake_customer = {"name": "Test User", "phone": "+18435551234"}
+        resp = create_appointment(fake_customer, "Pixel 6", "Screen Repair", "2025-08-28T10:00:00Z")
+        return {"created": resp}
+    except Exception as e:
+        return {"error": str(e)}
