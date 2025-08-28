@@ -1,4 +1,5 @@
 import os
+from urllib.parse import quote
 from twilio.rest import Client
 
 def start_outbound_call(lead: dict):
@@ -10,14 +11,14 @@ def start_outbound_call(lead: dict):
     # Fallback for APP_BASE_URL if not set
     base_url = os.getenv("APP_BASE_URL", "https://cpr-voice-leads-bot.onrender.com")
 
+    # Encode query parameters to avoid Twilio 400 errors
+    name = quote(lead.get("name", ""))
+    device = quote(lead.get("device", ""))
+    repair = quote(lead.get("repair_type", ""))
+    source = quote(lead.get("source", "online_lead"))
+
     # Build the outbound URL safely
-    url = (
-        f"{base_url}/voice/outbound/lead"
-        f"?name={lead.get('name', '')}"
-        f"&device={lead.get('device', '')}"
-        f"&repair={lead.get('repair_type', '')}"
-        f"&source={lead.get('source', 'online_lead')}"
-    )
+    url = f"{base_url}/voice/outbound/lead?name={name}&device={device}&repair={repair}&source={source}"
 
     client = Client(account_sid, auth_token)
 
