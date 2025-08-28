@@ -9,6 +9,8 @@ from calls import start_outbound_call
 from datetime import datetime
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
+from datetime import datetime as dt, timedelta
+import dateparser
 
 def norm_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
@@ -227,8 +229,6 @@ async def lead_process(req: Request):
         vr.redirect("/voice/inbound")  # back to Q&A mode
         return Response(str(vr), media_type="application/xml")
 
-from datetime import datetime as dt, timedelta
-import dateparser
 
 @app.post("/voice/outbound/lead/day")
 async def lead_day(req: Request):
@@ -269,7 +269,7 @@ async def lead_day(req: Request):
             media_type="application/xml"
         )
 
-# Try extracting time directly from parsed datetime
+    # Try extracting time directly from parsed datetime
     time_obj = parsed.time()
     open_time = dt.strptime("9:00 AM", "%I:%M %p").time()
     close_time = dt.strptime("6:00 PM", "%I:%M %p").time()
@@ -286,31 +286,16 @@ async def lead_day(req: Request):
             media_type="application/xml"
         )
 
-    # If time is valid and in range, skip time prompt
-    if time_obj and dt.strptime("9:00 AM", "%I:%M %p").time() <= time_obj <= dt.strptime("6:00 PM", "%I:%M %p").time():
-        time_str = time_obj.strftime("%I:%M %p").lstrip("0")
-        print(f"[Parsed Combined] Day={weekday}, Time={time_str}")
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                f"Got it. Let's get you booked for {weekday.capitalize()} at {time_str}. What's your first name?",
-                action=f"/voice/outbound/lead/intake?day={weekday.capitalize()}&time_slot={time_str}"
-            )),
-            media_type="application/xml"
-        )
-
-    # Otherwise, ask for time separately
+    # No valid/within-hours time in phrase → ask separately
     return Response(
         str(say_and_listen(
             VoiceResponse(),
             "What time works best for you? We’re open 9 A.M. to 6 P.M.",
-            action=f"/voice/outbound/lead/time?day={weekday.capitalize()}&time_slot={time_str}"
+            action=f"/voice/outbound/lead/time?day={weekday.capitalize()}"
         )),
         media_type="application/xml"
     )
 
-from datetime import datetime as dt
-import dateparser
 
 @app.post("/voice/outbound/lead/time")
 async def lead_time(req: Request, day: str = ""):
