@@ -209,7 +209,7 @@ def lead_intro(name: str = "", device: str = "", repair: str = "", source: str =
                 vr.say("We have the part available.")
             except Exception:
                 vr.say("I’m checking part availability.")
-    return Response(str(say_and_listen(vr, "Would you like to book a time?", action="/voice/outbound/lead/process")),
+    return Response(str(say_and_listen(vr, "Would you like to book an appointment?", action="/voice/outbound/lead/process")),
                     media_type="application/xml")
 
 # --- UPDATED: more forgiving, routes to intake flow ---
@@ -227,17 +227,16 @@ async def lead_process(req: Request):
         vr.redirect("/voice/inbound")  # back to Q&A mode
         return Response(str(vr), media_type="application/xml")
 
-# --- NEW: day selection -> full intake sequence ---
 from datetime import datetime as dt
+import dateparser
 
 @app.post("/voice/outbound/lead/day")
 async def lead_day(req: Request):
     form = await req.form()
-    chosen_day = (form.get("SpeechResult") or "").strip()
-    print(f"[Booking Day] Caller chose: {chosen_day}")
+    spoken_day = (form.get("SpeechResult") or "").strip()
+    print(f"[Booking Day] Caller said: {spoken_day}")
 
-    if not chosen_day:
-        # Didn't understand → re-ask
+    if not spoken_day:
         return Response(
             str(say_and_listen(
                 VoiceResponse(),
@@ -247,25 +246,35 @@ async def lead_day(req: Request):
             media_type="application/xml"
         )
 
-    # Validate against Mon–Sat
-    lower_day = chosen_day.lower()
-    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
-    if not any(d in lower_day for d in valid_days):
+    parsed_date = dateparser.parse(spoken_day)
+    if not parsed_date:
         return Response(
             str(say_and_listen(
                 VoiceResponse(),
-                "We’re open Monday through Saturday. Which day works best for you?",
+                "Could you say a day like Monday or a date like August 30th?",
                 action="/voice/outbound/lead/day"
             )),
             media_type="application/xml"
         )
 
-    # Ask for specific time slot, passing day along
+    weekday = parsed_date.strftime("%A").lower()
+    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    if weekday not in valid_days:
+        return Response(
+            str(say_and_listen(
+                VoiceResponse(),
+                "We’re open Monday through Saturday. What day works best for you?",
+                action="/voice/outbound/lead/day"
+            )),
+            media_type="application/xml"
+        )
+
+    # Pass normalized weekday into time step
     return Response(
         str(say_and_listen(
             VoiceResponse(),
             "What time works best for you? We’re open 9 A.M. to 6 P.M.",
-            action=f"/voice/outbound/lead/time?day={chosen_day}"
+            action=f"/voice/outbound/lead/time?day={weekday.capitalize()}"
         )),
         media_type="application/xml"
     )
@@ -273,7 +282,7 @@ async def lead_day(req: Request):
 @app.post("/voice/outbound/lead/time")
 async def lead_time(req: Request, day: str = ""):
     form = await req.form()
-    spoken_time = (form.get("SpeechResult") or "").strip()
+    spoken_time = (form.get("SpeechResult") or "").strip().lower().replace(".", "")
     print(f"[Booking Time] day={day}, spoken_time={spoken_time}")
 
     if not spoken_time:
@@ -286,17 +295,27 @@ async def lead_time(req: Request, day: str = ""):
             media_type="application/xml"
         )
 
-    # Try parsing common formats
     chosen_time_obj = None
+    assumed = spoken_time
+
+    # Try parsing directly
     for fmt in ("%I:%M %p", "%I %p"):
         try:
-            chosen_time_obj = dt.strptime(spoken_time.replace(".", "").upper(), fmt).time()
+            chosen_time_obj = dt.strptime(spoken_time.upper(), fmt).time()
             break
         except ValueError:
             pass
 
-    # Invalid format → re‑ask
+    # If still not parsed, assume PM if it's just a digit
+    if not chosen_time_obj and spoken_time.isdigit():
+        assumed = f"{spoken_time} pm"
+        try:
+            chosen_time_obj = dt.strptime(assumed.upper(), "%I %p").time()
+        except ValueError:
+            pass
+
     if not chosen_time_obj:
+        print(f"[Time Parsing Failed] Raw='{spoken_time}' → Assumed='{assumed}'")
         return Response(
             str(say_and_listen(
                 VoiceResponse(),
@@ -317,10 +336,9 @@ async def lead_time(req: Request, day: str = ""):
             media_type="application/xml"
         )
 
-    # Nicely formatted string for storage
     time_str = chosen_time_obj.strftime("%I:%M %p").lstrip("0")
+    print(f"[Time Parsed] Final={time_str}")
 
-    # Go to intake with both day & time_slot
     return Response(
         str(say_and_listen(
             VoiceResponse(),
@@ -329,7 +347,6 @@ async def lead_time(req: Request, day: str = ""):
         )),
         media_type="application/xml"
     )
-
 @app.post("/voice/outbound/lead/intake")
 async def lead_intake(
     req: Request,
