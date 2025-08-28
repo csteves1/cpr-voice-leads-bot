@@ -17,3 +17,19 @@ def lookup_price(device_raw: str, repair_type_raw: str):
                 "repair_type": row.get("RepairType"),
             }
     return None
+
+def lookup_price_rows():
+    """
+    Returns ALL price rows from the Google Sheet in normalized dict form.
+    Each row will contain Device, RepairType, Price, SKU, and RepairQItemId keys.
+    """
+    rows_out = []
+    for row in get_price_rows():
+        rows_out.append({
+            "Device": row.get("Device", ""),
+            "RepairType": row.get("RepairType", ""),
+            "Price": row.get("Price"),
+            "SKU": row.get("SKU"),
+            "RepairQItemId": row.get("RepairQItemId")
+        })
+    return rows_out 
