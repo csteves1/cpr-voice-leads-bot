@@ -503,10 +503,56 @@ async def lead_intake(
         vr_final.redirect("/voice/inbound")
         return Response(str(vr_final), media_type="application/xml")
 
-    # Failsafe
+        # Failsafe
     return repeat_q("Sorry, I didn’t catch that. Could you repeat?")
+
+# === NEW: General phone repair Q&A after booking ===
+@app.post("/voice/inbound")
+async def voice_inbound(req: Request):
+    """Entry point after booking to handle general phone repair questions."""
+    form = await req.form()
+    answer = (form.get("SpeechResult") or "").strip()
+    print(f"[Inbound Q&A] answer={answer}")
+
+    # First turn – greet and invite a question
+    if not answer:
+        vr = VoiceResponse()
+        g = Gather(
+            input="speech",
+            action="/voice/inbound",
+            method="POST",
+            timeout=15,
+            speech_timeout="auto",
+            speech_model="phone_call"
+        )
+        g.say("What would you like to know? You can ask about our hours, our location, how long repairs take, or any other phone repair question.")
+        vr.append(g)
+        return Response(str(vr), media_type="application/xml")
+
+    lower = answer.lower()
+    vr = VoiceResponse()
+
+    # Quick fixed answers for common topics
+    if "hour" in lower:
+        vr.say(f"Our hours are {STORE_INFO['hours']}.")
+    elif "location" in lower or "address" in lower or "where" in lower:
+        vr.say(f"We're at {STORE_INFO['address']}.")
+    elif "how long" in lower or "long" in lower or "turnaround" in lower:
+        vr.say("We usually quote repairs at 1 to 2 hours once we begin work.")
+    else:
+        # Hand off to your existing AI repair Q&A flow
+        vr.redirect("/voice/inbound/process")
+        return Response(str(vr), media_type="application/xml")
+
+    # After answering, loop back so they can ask more
+    vr.redirect("/voice/inbound")
+    return Response(str(vr), media_type="application/xml")
+
+# Health check
 @app.get("/health")
-def health(): return {"ok": True}
+def health():
+    return {"ok": True}
+
 # Test‑only: get inventory for a given SKU
 @app.get("/dev/inventory/{sku}")
 def dev_inventory(sku: str):
