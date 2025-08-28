@@ -308,10 +308,13 @@ async def lead_day(req: Request):
         media_type="application/xml"
     )
 
+from datetime import datetime as dt
+import dateparser
+
 @app.post("/voice/outbound/lead/time")
 async def lead_time(req: Request, day: str = ""):
     form = await req.form()
-    spoken_time = (form.get("SpeechResult") or "").strip().lower().replace(".", "")
+    spoken_time = (form.get("SpeechResult") or "").strip()
     print(f"[Booking Time] day={day}, spoken_time={spoken_time}")
 
     if not spoken_time:
@@ -324,25 +327,23 @@ async def lead_time(req: Request, day: str = ""):
             media_type="application/xml"
         )
 
-    time_obj = None
-    assumed = spoken_time
+    # Normalize common speech-to-text quirks
+    cleaned = (
+        spoken_time.lower()
+        .replace(".", "")
+        .replace("a m", "am")
+        .replace("p m", "pm")
+        .replace("a.m", "am")
+        .replace("p.m", "pm")
+        .replace(" o clock", "")
+        .strip()
+    )
+    print(f"[Time Normalized] Raw='{spoken_time}' → Cleaned='{cleaned}'")
 
-    for fmt in ("%I:%M %p", "%I %p"):
-        try:
-            time_obj = dt.strptime(spoken_time.upper(), fmt).time()
-            break
-        except ValueError:
-            pass
-
-    if not time_obj and spoken_time.isdigit():
-        assumed = f"{spoken_time} pm"
-        try:
-            time_obj = dt.strptime(assumed.upper(), "%I %p").time()
-        except ValueError:
-            pass
-
-    if not time_obj:
-        print(f"[Time Parsing Failed] Raw='{spoken_time}' → Assumed='{assumed}'")
+    # Try parsing with dateparser
+    parsed = dateparser.parse(cleaned)
+    if not parsed:
+        print(f"[Time Parsing Failed] Cleaned='{cleaned}' → Parsed=None")
         return Response(
             str(say_and_listen(
                 VoiceResponse(),
@@ -352,7 +353,12 @@ async def lead_time(req: Request, day: str = ""):
             media_type="application/xml"
         )
 
-    if not (dt.strptime("9:00 AM", "%I:%M %p").time() <= time_obj <= dt.strptime("6:00 PM", "%I:%M %p").time()):
+    time_obj = parsed.time()
+    open_time = dt.strptime("9:00 AM", "%I:%M %p").time()
+    close_time = dt.strptime("6:00 PM", "%I:%M %p").time()
+
+    if not (open_time <= time_obj <= close_time):
+        print(f"[Time Out of Range] Parsed={time_obj}")
         return Response(
             str(say_and_listen(
                 VoiceResponse(),
@@ -373,6 +379,7 @@ async def lead_time(req: Request, day: str = ""):
         )),
         media_type="application/xml"
     )
+    
 @app.post("/voice/outbound/lead/intake")
 async def lead_intake(
     req: Request,
