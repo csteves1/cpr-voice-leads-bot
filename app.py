@@ -393,13 +393,13 @@ async def lead_intake(
           f"phone={phone}, alt_phone={alt_phone}, email={email}, zip_code={zip_code}, referral={referral}, "
           f"imei={imei}, device_model={device_model}, passcode={passcode}, diagnostic={diagnostic}, answer={answer}")
 
-    # Enhanced repeat_q: always carry day and time_slot
+    from urllib.parse import urlencode
+
     def repeat_q(prompt, **kwargs):
-        # Preserve day/time_slot if not explicitly overridden
         kwargs.setdefault("day", day)
         kwargs.setdefault("time_slot", time_slot)
         print(f"[Prompting] {prompt} | next_params={kwargs}")
-        params = "&".join([f"{k}={v}" for k, v in kwargs.items()])
+        params = urlencode(kwargs)  # ✅ encodes spaces, punctuation, etc.
         vrq = VoiceResponse()
         vrq.say(prompt)
         g = Gather(
@@ -412,7 +412,6 @@ async def lead_intake(
         )
         vrq.append(g)
         return Response(str(vrq), media_type="application/xml")
-
     # Step-by-step checks
     if not first_name:
         if not answer:
