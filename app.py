@@ -11,6 +11,7 @@ from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from datetime import datetime as dt, timedelta
 import dateparser
+from urllib.parse import quote_plus
 
 def norm_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
@@ -276,12 +277,13 @@ async def lead_day(req: Request):
 
     if time_obj and open_time <= time_obj <= close_time:
         time_str = time_obj.strftime("%I:%M %p").lstrip("0")
+        encoded_time = quote_plus(time_str)  # encode after creating it
         print(f"[Parsed Combined] Day={weekday}, Time={time_str}")
         return Response(
             str(say_and_listen(
                 VoiceResponse(),
                 f"Got it. Let's get you booked for {weekday.capitalize()} at {time_str}. What's your first name?",
-                action=f"/voice/outbound/lead/intake?day={weekday.capitalize()}&time_slot={time_str}"
+                action=f"/voice/outbound/lead/intake?day={weekday.capitalize()}&time_slot={encoded_time}"
             )),
             media_type="application/xml"
         )
@@ -355,13 +357,14 @@ async def lead_time(req: Request, day: str = ""):
         )
 
     time_str = time_obj.strftime("%I:%M %p").lstrip("0")
+    encoded_time = quote_plus(time_str)  # encode here, not earlier
     print(f"[Time Parsed] Final={time_str}")
 
     return Response(
         str(say_and_listen(
             VoiceResponse(),
             f"Got it. Let's get you booked for {day} at {time_str}. What's your first name?",
-            action=f"/voice/outbound/lead/intake?day={day}&time_slot={time_str}"
+            action=f"/voice/outbound/lead/intake?day={day}&time_slot={encoded_time}"
         )),
         media_type="application/xml"
     )
