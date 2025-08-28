@@ -7,13 +7,25 @@ def start_outbound_call(lead: dict):
     auth_token = os.getenv("TWILIO_AUTH_TOKEN")
     from_number = os.getenv("TWILIO_FROM_NUMBER")
 
+    # Fallback for APP_BASE_URL if not set
+    base_url = os.getenv("APP_BASE_URL", "https://cpr-voice-leads-bot.onrender.com")
+
+    # Build the outbound URL safely
+    url = (
+        f"{base_url}/voice/outbound/lead"
+        f"?name={lead.get('name', '')}"
+        f"&device={lead.get('device', '')}"
+        f"&repair={lead.get('repair_type', '')}"
+        f"&source={lead.get('source', 'online_lead')}"
+    )
+
     client = Client(account_sid, auth_token)
 
     call = client.calls.create(
         to=lead["phone"],
         from_=from_number,
-        url=f"{os.getenv('APP_BASE_URL')}/voice/outbound/lead"
-            f"?name={lead['name']}&device={lead['device']}&repair={lead['repair_type']}&source={lead['source']}"
+        url=url
     )
+
     print(f"[CALLS] Started outbound call SID={call.sid} to {lead['phone']}")
     return call
