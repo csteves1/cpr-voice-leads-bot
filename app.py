@@ -61,6 +61,7 @@ def save_mock_ticket(data: dict):
 
         service = build("sheets", "v4", credentials=creds)
         values = [[
+            data.get("day", ""),
             data.get("time_slot", ""),
             data.get("first_name", ""),
             data.get("last_name", ""),
@@ -208,7 +209,7 @@ def lead_intro(name: str = "", device: str = "", repair: str = "", source: str =
                 vr.say("We have the part available.")
             except Exception:
                 vr.say("I’m checking part availability.")
-    return Response(str(say_and_listen(vr, "Would you like to book a time today?", action="/voice/outbound/lead/process")),
+    return Response(str(say_and_listen(vr, "Would you like to book a time?", action="/voice/outbound/lead/process")),
                     media_type="application/xml")
 
 # --- UPDATED: more forgiving, routes to intake flow ---
@@ -219,41 +220,121 @@ async def lead_process(req: Request):
     vr = VoiceResponse()
     yes_words = ["yes","book","schedule","sure","yeah","yep","please","ok","okay","yup","why not"]
     if any(w in speech for w in yes_words):
-        return Response(str(say_and_listen(vr, "Great. Morning or afternoon works better?", action="/voice/outbound/lead/time")),
+        return Response(str(say_and_listen(vr, "Great. Which day would you like to come in?", action="/voice/outbound/lead/day")),
                         media_type="application/xml")
     else:
         vr.say("No problem. If you need anything later, just call us.")
         vr.redirect("/voice/inbound")  # back to Q&A mode
         return Response(str(vr), media_type="application/xml")
 
-# --- NEW: time slot -> full intake sequence ---
-@app.post("/voice/outbound/lead/time")
-async def lead_time(req: Request):
-    form = await req.form()
-    choice = (form.get("SpeechResult") or "").lower()
-    if "morning" in choice:
-        chosen_time = "morning"
-    elif "afternoon" in choice:
-        chosen_time = "afternoon"
-    else:
-                # Didn't understand → re-ask without hanging up
-        return Response(str(say_and_listen(
-            VoiceResponse(),
-            "Sorry, I didn’t catch that. Morning or afternoon works better?",
-            action="/voice/outbound/lead/time"
-        )), media_type="application/xml")
+# --- NEW: day selection -> full intake sequence ---
+from datetime import datetime as dt
 
-    # Start the intake sequence — first name is first
-    return Response(str(say_and_listen(
-        VoiceResponse(),
-        "Got it. What's your first name?",
-        action=f"/voice/outbound/lead/intake?time={chosen_time}"
-    )), media_type="application/xml")
+@app.post("/voice/outbound/lead/day")
+async def lead_day(req: Request):
+    form = await req.form()
+    chosen_day = (form.get("SpeechResult") or "").strip()
+    print(f"[Booking Day] Caller chose: {chosen_day}")
+
+    if not chosen_day:
+        # Didn't understand → re-ask
+        return Response(
+            str(say_and_listen(
+                VoiceResponse(),
+                "Sorry, I didn’t catch that. Which day would you like to come in?",
+                action="/voice/outbound/lead/day"
+            )),
+            media_type="application/xml"
+        )
+
+    # Validate against Mon–Sat
+    lower_day = chosen_day.lower()
+    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
+    if not any(d in lower_day for d in valid_days):
+        return Response(
+            str(say_and_listen(
+                VoiceResponse(),
+                "We’re open Monday through Saturday. Which day works best for you?",
+                action="/voice/outbound/lead/day"
+            )),
+            media_type="application/xml"
+        )
+
+    # Ask for specific time slot, passing day along
+    return Response(
+        str(say_and_listen(
+            VoiceResponse(),
+            "What time works best for you? We’re open 9 A.M. to 6 P.M.",
+            action=f"/voice/outbound/lead/time?day={chosen_day}"
+        )),
+        media_type="application/xml"
+    )
+
+@app.post("/voice/outbound/lead/time")
+async def lead_time(req: Request, day: str = ""):
+    form = await req.form()
+    spoken_time = (form.get("SpeechResult") or "").strip()
+    print(f"[Booking Time] day={day}, spoken_time={spoken_time}")
+
+    if not spoken_time:
+        return Response(
+            str(say_and_listen(
+                VoiceResponse(),
+                "Sorry, I didn’t catch that. What time works best for you between 9 A.M. and 6 P.M.?",
+                action=f"/voice/outbound/lead/time?day={day}"
+            )),
+            media_type="application/xml"
+        )
+
+    # Try parsing common formats
+    chosen_time_obj = None
+    for fmt in ("%I:%M %p", "%I %p"):
+        try:
+            chosen_time_obj = dt.strptime(spoken_time.replace(".", "").upper(), fmt).time()
+            break
+        except ValueError:
+            pass
+
+    # Invalid format → re‑ask
+    if not chosen_time_obj:
+        return Response(
+            str(say_and_listen(
+                VoiceResponse(),
+                "Could you say a specific time like 10 A.M. or 1:30 P.M.? We’re open 9 A.M. to 6 P.M.",
+                action=f"/voice/outbound/lead/time?day={day}"
+            )),
+            media_type="application/xml"
+        )
+
+    # Range check
+    if not (dt.strptime("9:00 AM", "%I:%M %p").time() <= chosen_time_obj <= dt.strptime("6:00 PM", "%I:%M %p").time()):
+        return Response(
+            str(say_and_listen(
+                VoiceResponse(),
+                "Our hours are 9 A.M. to 6 P.M. What time within those hours works for you?",
+                action=f"/voice/outbound/lead/time?day={day}"
+            )),
+            media_type="application/xml"
+        )
+
+    # Nicely formatted string for storage
+    time_str = chosen_time_obj.strftime("%I:%M %p").lstrip("0")
+
+    # Go to intake with both day & time_slot
+    return Response(
+        str(say_and_listen(
+            VoiceResponse(),
+            f"Got it. Let's get you booked for {day} at {time_str}. What's your first name?",
+            action=f"/voice/outbound/lead/intake?day={day}&time_slot={time_str}"
+        )),
+        media_type="application/xml"
+    )
 
 @app.post("/voice/outbound/lead/intake")
 async def lead_intake(
     req: Request,
-    time: str,
+    day: str = "",
+    time_slot: str = "",
     first_name: str = "",
     last_name: str = "",
     phone: str = "",
@@ -268,8 +349,8 @@ async def lead_intake(
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
-    print(f"[Intake] time={time}, first_name={first_name}, last_name={last_name}, phone={phone}, alt_phone={alt_phone}, email={email}, zip_code={zip_code}, referral={referral}, imei={imei}, device_model={device_model}, passcode={passcode}, diagnostic={diagnostic}, answer={answer}")
-    
+    print(f"[Intake] day={day}, time_slot={time_slot}, first_name={first_name}, last_name={last_name}, phone={phone}, alt_phone={alt_phone}, email={email}, zip_code={zip_code}, referral={referral}, imei={imei}, device_model={device_model}, passcode={passcode}, diagnostic={diagnostic}, answer={answer}")
+
     def repeat_q(prompt, **kwargs):
         print(f"[Prompting] {prompt} | next_params={kwargs}")
         params = "&".join([f"{k}={v}" for k, v in kwargs.items()])
@@ -286,60 +367,71 @@ async def lead_intake(
         vrq.append(g)
         return Response(str(vrq), media_type="application/xml")
 
+    # --- your existing step-by-step checks here, unchanged ---
+    # In your final ticket dict, replace:
+    # "time_slot": time
+    # with:
+    # "day": day,
+    # "time_slot": time_slot
+
+    # And in your thank-you message:
+    # vr_final.say(f"Thanks {first_name}, you're booked for {day} at {time_slot}. I've saved your ticket.")
     # Step-by-step checks
+    
     if not first_name:
         if not answer:
-            return repeat_q("What's your first name?", time=time)
-        return repeat_q("Thanks. What's your last name?", time=time, first_name=answer)
+            return repeat_q("What's your first name?", day=day, time_slot=time_slot)
+        return repeat_q("Thanks. What's your last name?", day=day, time_slot=time_slot, first_name=answer)
 
     if not last_name:
         if not answer:
-            return repeat_q("What's your last name?", time=time, first_name=first_name)
-        return repeat_q("What's the best phone number to reach you?", time=time, first_name=first_name, last_name=answer)
+            return repeat_q("What's your last name?", day=day, time_slot=time_slot, first_name=first_name)
+        return repeat_q("What's the best phone number to reach you?", day=day, time_slot=time_slot, first_name=first_name, last_name=answer)
 
     if not phone:
         if not answer:
-            return repeat_q("What's the best phone number to reach you?", time=time, first_name=first_name, last_name=last_name)
-        return repeat_q("Do you have an alternate phone number? If not, just say no.", time=time, first_name=first_name, last_name=last_name, phone=answer)
+            return repeat_q("What's the best phone number to reach you?",day=day, time_slot=time_slot, first_name=first_name, last_name=last_name)
+        return repeat_q("Do you have an alternate phone number? If not, just say no.", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=answer)
 
     if not alt_phone:
         if not answer:
-            return repeat_q("Do you have an alternate phone number? If not, just say no.", time=time, first_name=first_name, last_name=last_name, phone=phone)
-        return repeat_q("What's your email address?", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=answer)
+            return repeat_q("Do you have an alternate phone number? If not, just say no.", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone)
+        return repeat_q("What's your email address?", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=answer)
 
     if not email:
         if not answer:
-            return repeat_q("What's your email address?", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone)
-        return repeat_q("What's your zip code?", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=answer)
+            return repeat_q("What's your email address?", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone)
+        return repeat_q("What's your zip code?", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=answer)
 
     if not zip_code:
         if not answer:
-            return repeat_q("What's your zip code?", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email)
-        return repeat_q("How did you hear about us?", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email, zip_code=answer)
+            return repeat_q("What's your zip code?", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email)
+        return repeat_q("How did you hear about us?", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email, zip_code=answer)
 
     if not referral:
         if not answer:
-            return repeat_q("How did you hear about us?", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email, zip_code=zip_code)
-        return repeat_q("Can you provide the device IMEI? If not, just say no.", time=time, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email, zip_code=zip_code, referral=answer)
+            return repeat_q("How did you hear about us?", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email, zip_code=zip_code)
+        return repeat_q("Can you provide the device IMEI? If not, just say no.", day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email, zip_code=zip_code, referral=answer)
 
     if not imei:
         imei_value = "" if answer.lower() in ["no", "nah", "none"] else answer
         return repeat_q("Do you have a passcode for the device? If not, say no.",
-            time=time, first_name=first_name, last_name=last_name, phone=phone,
+            day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone,
             alt_phone=alt_phone, email=email, zip_code=zip_code, referral=referral,
             imei=imei_value, device_model="")
 
     if not passcode:
         passcode_value = "" if answer.lower() in ["no", "nah", "none"] else answer
         return repeat_q("Briefly describe the issue with the device.",
-            time=time, first_name=first_name, last_name=last_name, phone=phone,
+            day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone,
             alt_phone=alt_phone, email=email, zip_code=zip_code, referral=referral,
             imei=imei, device_model=device_model, passcode=passcode_value)
 
     if not diagnostic:
         diagnostic_value = answer
         ticket = {
-            "time_slot": time,
+            "day": day,
+            "time_slot": time_slot,
             "first_name": first_name,
             "last_name": last_name,
             "phone": phone,
@@ -361,13 +453,13 @@ async def lead_intake(
             print(f"[ERROR saving ticket] {e}")
 
         vr_final = VoiceResponse()
-        vr_final.say(f"Thanks {first_name}, you're booked for the {time}. I've saved your ticket.")
+        vr_final.say(f"Thanks {first_name}, you're booked for the {day} at {time_slot}. I've saved your ticket.")
         vr_final.say("I can also answer general phone repair questions if you have any.")
         vr_final.redirect("/voice/inbound")
         return Response(str(vr_final), media_type="application/xml")
 
     # If somehow we got here without matching a step, ask again
-    return repeat_q("Sorry, I didn’t catch that. Could you repeat?", time=time)
+    return repeat_q("Sorry, I didn’t catch that. Could you repeat?", day=day, time_slot=time_slot)
 
 @app.get("/health")
 def health(): return {"ok": True}
