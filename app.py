@@ -104,6 +104,197 @@ DEVICE_MODELS = {
     ]
 }
 
+# ---------------------------
+# Dynamic intake configuration
+# ---------------------------
+
+REQUIRED_FIELDS = [
+    "day",
+    "time_slot",
+    "first_name",
+    "last_name",
+    "phone",
+    "alt_phone",
+    "email",
+    "zip_code",
+    "referral",
+    "imei",
+    "device_model",
+    "passcode",
+    "diagnostic"
+]
+
+FIELD_PROMPTS = {
+    "day": "What day works best for your appointment?",
+    "time_slot": "What time of day works best? Morning, early afternoon, or late afternoon?",
+    "first_name": "What's your first name?",
+    "last_name": "What's your last name?",
+    "phone": "What's the best phone number to reach you?",
+    "alt_phone": "Do you have an alternate phone number? If not, just say no.",
+    "email": "What's your email address?",
+    "zip_code": "What's your zip code?",
+    "referral": "How did you hear about us?",
+    "imei": "Please read your fifteen-digit I M E I number, or say skip if not available.",
+    "device_model": "What device model is it?",
+    "passcode": "Do you have a passcode for the device? If not, say no.",
+    "diagnostic": "Briefly describe the issue with the device."
+}
+
+# ---------------------------
+# Shared utilities
+# ---------------------------
+
+def is_skip(text: str) -> bool:
+    t = (text or "").strip().lower()
+    return any(p in t for p in ["skip", "na", "n/a", "none"]) or t == "no"
+
+def wants_yes(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p in t for p in ["yes", "yep", "correct", "that's right", "looks good", "good to go"])
+
+def wants_no(text: str) -> bool:
+    t = (text or "").lower()
+    return any(p in t for p in ["no", "nope", "not quite", "change", "fix", "edit"])
+
+def build_lead_state(**kwargs) -> dict:
+    return {field: kwargs.get(field, "") for field in REQUIRED_FIELDS}
+
+def next_missing_field(lead_state: dict) -> str | None:
+    for field in REQUIRED_FIELDS:
+        if not lead_state.get(field):
+            return field
+    return None
+
+def repeat_q(prompt, *, action_path="/voice/outbound/lead/intake", timeout=15, speech_timeout="auto", day="", time_slot="", stage="", reported_model="", **kwargs):
+    # Preserve shared context across turns
+    kwargs.setdefault("day", day)
+    kwargs.setdefault("time_slot", time_slot)
+    kwargs.setdefault("stage", stage)
+    kwargs.setdefault("reported_model", reported_model)
+
+    params = urlencode(kwargs)
+
+    vrq = VoiceResponse()
+    vrq.say(prompt)
+    g = Gather(
+        input="speech",
+        action=f"{action_path}?{params}",
+        method="POST",
+        timeout=timeout,
+        speech_timeout=speech_timeout,
+        speech_model="phone_call"
+    )
+    vrq.append(g)
+    return Response(str(vrq), media_type="application/xml")
+
+def read_back_summary(lead_state: dict) -> str:
+    def safe(v): return v if v and v != "NA" else "not provided"
+    lines = [
+        f"Day: {safe(lead_state.get('day'))}",
+        f"Time: {safe(lead_state.get('time_slot'))}",
+        f"First name: {safe(lead_state.get('first_name'))}",
+        f"Last name: {safe(lead_state.get('last_name'))}",
+        f"Primary phone: {safe(lead_state.get('phone'))}",
+        f"Alternate phone: {safe(lead_state.get('alt_phone'))}",
+        f"Email: {safe(lead_state.get('email'))}",
+        f"Zip code: {safe(lead_state.get('zip_code'))}",
+        f"Referral: {safe(lead_state.get('referral'))}",
+        f"IMEI: {safe(lead_state.get('imei'))}",
+        f"Device model: {safe(lead_state.get('device_model'))}",
+        f"Passcode: {safe(lead_state.get('passcode'))}",
+        f"Diagnostic: {safe(lead_state.get('diagnostic'))}",
+    ]
+    return "Here’s what I have: " + ". ".join(lines) + ". Does this look correct?"
+
+
+def imei_stage_logic(answer: str, lead_state: dict, reported_model: str = ""):
+    # Skip or missing → mark NA and continue
+    if not answer or is_skip(answer):
+        lead_state["imei"] = "NA"
+        return None, lead_state, ""
+
+    digits_only = extract_value(answer, "imei")  # should return 15-digit string or ""
+    if len(digits_only) != 15:
+        return "imei_reprompt", lead_state, ""
+
+    imei_info = imei_lookup(digits_only)
+    lead_state["imei"] = digits_only
+    api_model = (imei_info.get("model") or "").strip()
+
+    if api_model:
+        existing = (lead_state.get("device_model") or "").strip()
+        if existing and api_model.lower() != existing.lower():
+            return "confirm_device_model", lead_state, api_model
+        if not existing:
+            lead_state["device_model"] = api_model
+
+    return None, lead_state, ""
+
+
+def handle_field_progression(answer: str, stage: str, reported_model: str, **current_values):
+    lead_state = build_lead_state(**current_values)
+
+    # Special confirmation for IMEI-reported model
+    if stage == "confirm_device_model":
+        if wants_yes(answer):
+            lead_state["device_model"] = reported_model
+            stage = ""
+        elif wants_no(answer):
+            return {"prompt": "Got it — what's the correct device model?", "stage": "device_model", "lead_state": lead_state}
+        else:
+            return {"prompt": f"I checked the IMEI and it shows {reported_model}. Is that correct?", "stage": "confirm_device_model", "lead_state": lead_state}
+
+    # IMEI field
+    if stage == "imei":
+        imei_branch, lead_state, api_model = imei_stage_logic(answer, lead_state, reported_model)
+        if imei_branch == "imei_reprompt":
+            return {"prompt": "I only heard part of the number. Please read your complete fifteen-digit I M E I number, digit by digit.", "stage": "imei", "lead_state": lead_state, "timeout": 12}
+        if imei_branch == "confirm_device_model":
+            return {"prompt": f"I checked the IMEI and it shows {api_model}. Is that correct?", "stage": "confirm_device_model", "lead_state": lead_state, "reported_model": api_model}
+        stage = ""
+
+    # Normal field capture (including day/time)
+    if stage and stage in REQUIRED_FIELDS:
+        if not answer:
+            return {"prompt": FIELD_PROMPTS[stage], "stage": stage, "lead_state": lead_state}
+        if is_skip(answer):
+            lead_state[stage] = "NA"
+        else:
+            parsed = extract_value(answer, stage) or answer
+            lead_state[stage] = parsed
+        stage = ""
+
+    # Advance to next missing
+    next_field = next_missing_field(lead_state)
+    if next_field:
+        kwargs = {"timeout": 12, "speech_timeout": "auto"} if next_field == "imei" else {}
+        return {"prompt": FIELD_PROMPTS[next_field], "stage": next_field, "lead_state": lead_state, **kwargs}
+
+    # Summary confirmation
+    return {"prompt": read_back_summary(lead_state), "stage": "confirm_summary", "lead_state": lead_state}
+
+
+async def proceed_to_quote_and_confirm(*, action_path="/voice/outbound/lead/intake", **lead_state):
+    device = lead_state.get("device_model") or ""
+    diag = lead_state.get("diagnostic") or ""
+    price_row = lookup_price(device, diag)  # optional
+
+    if price_row and price_row.get("price"):
+        say = f"The current price for that repair is {price_row['price']}."
+        summary = read_back_summary(lead_state)
+        prompt = f"{say} {summary}"
+        return repeat_q(prompt, action_path=action_path, stage="confirm_summary", **lead_state)
+
+    try:
+        create_appointment(lead_state)
+        return repeat_q("Great — I’ve created your ticket. Would you like a text with directions to the store?",
+                        action_path=action_path, stage="post_ticket", **lead_state)
+    except Exception:
+        return repeat_q("Thanks. I’m having trouble creating the ticket right now. I’ll save your details and a technician will follow up shortly.",
+                        action_path=action_path, **lead_state)
+
+
+
 # Flattened list for quick search
 ALL_DEVICE_MODELS = [m for brand in DEVICE_MODELS.values() for m in brand]
 
@@ -522,179 +713,41 @@ async def repairq_lead(req: Request):
 
 @app.post("/voice/outbound/lead")
 @app.get("/voice/outbound/lead")
-def lead_intro(name: str = "", device: str = "", repair: str = "", source: str = "online_lead"):
-    vr = VoiceResponse()
-    if source == "website_appt":
-        vr.say(f"Hi {name}, this is {STORE_INFO['name']} confirming your appointment request.")
-    else:
-        vr.say(f"Hi {name}, this is {STORE_INFO['name']}. I saw your interest in a {repair} for your {device}.")
-    p = lookup_price(device, repair)
-    if p and p.get("price"):
-        vr.say(f"The current price for that repair is {p['price']}.")
-        if p.get("sku"):
-            try:
-                inv = get_inventory_by_sku(p["sku"])
-                # Adjust to your schema; set a safe default message:
-                vr.say("We have the part available.")
-            except Exception:
-                vr.say("I’m checking part availability.")
-    return Response(str(say_and_listen(vr, "Would you like to book an appointment?", action="/voice/outbound/lead/process")),
-                    media_type="application/xml")
-
-# --- UPDATED: more forgiving, routes to intake flow ---
+async def voice_outbound_lead(req: Request, **state):
+    """Entry point for outbound calls — hand straight to intake AI engine."""
+    # state here comes from query params (RepairQ lead info)
+    return repeat_q(
+        "Hi, let's get a few quick details to help with your booking.",
+        action_path="/voice/outbound/lead/intake",
+        stage=state.get("stage", ""), 
+        **{f: state.get(f, "") for f in REQUIRED_FIELDS}
+    )
 @app.post("/voice/outbound/lead/process")
-async def lead_process(req: Request):
+async def outbound_lead_process(req: Request, **state):
     form = await req.form()
-    speech = (form.get("SpeechResult") or "").lower()
-    vr = VoiceResponse()
-    yes_words = ["yes","book","schedule","sure","yeah","yep","please","ok","okay","yup","why not"]
-    if any(w in speech for w in yes_words):
-        return Response(str(say_and_listen(vr, "Great. Which day would you like to come in?", action="/voice/outbound/lead/day")),
-                        media_type="application/xml")
-    else:
-        vr.say("No problem. If you need anything later, just call us.")
-        vr.redirect("/voice/inbound")  # back to Q&A mode
-        return Response(str(vr), media_type="application/xml")
+    answer = (form.get("SpeechResult") or "").strip()
 
-
-@app.post("/voice/outbound/lead/day")
-async def lead_day(req: Request):
-    form = await req.form()
-    spoken = (form.get("SpeechResult") or "").strip()
-    print(f"[Booking Day] Caller said: {spoken}")
-
-    if not spoken:
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                "Sorry, I didn’t catch that. Which day would you like to come in?",
-                action="/voice/outbound/lead/day"
-            )),
-            media_type="application/xml"
-        )
-
-    parsed = dateparser.parse(spoken)
-    if not parsed:
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                "Could you say a day like Friday or a date like August 29th?",
-                action="/voice/outbound/lead/day"
-            )),
-            media_type="application/xml"
-        )
-
-    weekday = parsed.strftime("%A").lower()
-    valid_days = ["monday", "tuesday", "wednesday", "thursday", "friday", "saturday"]
-    if weekday not in valid_days:
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                "We’re open Monday through Saturday. What day works best for you?",
-                action="/voice/outbound/lead/day"
-            )),
-            media_type="application/xml"
-        )
-
-    # Try extracting time directly from parsed datetime
-    time_obj = parsed.time()
-    open_time = dt.strptime("9:00 AM", "%I:%M %p").time()
-    close_time = dt.strptime("6:00 PM", "%I:%M %p").time()
-
-    if time_obj and open_time <= time_obj <= close_time:
-        time_str = time_obj.strftime("%I:%M %p").lstrip("0")
-        encoded_time = quote_plus(time_str)  # encode after creating it
-        print(f"[Parsed Combined] Day={weekday}, Time={time_str}")
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                f"Got it. Let's get you booked for {weekday.capitalize()} at {time_str}. What's your first name?",
-                action=f"/voice/outbound/lead/intake?day={weekday.capitalize()}&time_slot={encoded_time}"
-            )),
-            media_type="application/xml"
-        )
-
-    # No valid/within-hours time in phrase → ask separately
-    return Response(
-        str(say_and_listen(
-            VoiceResponse(),
-            "What time works best for you? We’re open 9 A.M. to 6 P.M.",
-            action=f"/voice/outbound/lead/time?day={weekday.capitalize()}"
-        )),
-        media_type="application/xml"
+    result = handle_field_progression(
+        answer=answer,
+        stage=state.get("stage", ""),
+        reported_model=state.get("reported_model", ""),
+        **{f: state.get(f, "") for f in REQUIRED_FIELDS}
     )
-
-
-@app.post("/voice/outbound/lead/time")
-async def lead_time(req: Request, day: str = ""):
-    form = await req.form()
-    spoken_time = (form.get("SpeechResult") or "").strip()
-    print(f"[Booking Time] day={day}, spoken_time={spoken_time}")
-
-    if not spoken_time:
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                "Sorry, I didn’t catch that. What time works best for you between 9 A.M. and 6 P.M.?",
-                action=f"/voice/outbound/lead/time?day={day}"
-            )),
-            media_type="application/xml"
+    if result and result.get("prompt"):
+        return repeat_q(
+            result["prompt"],
+            action_path="/voice/outbound/lead/process",
+            stage=result.get("stage", ""),
+            reported_model=result.get("reported_model", ""),
+            timeout=25,
+            speech_timeout="auto",
+            **result["lead_state"]
         )
+    return repeat_q("Sorry, I didn’t catch that. Could you repeat?",
+                    action_path="/voice/outbound/lead/process",
+                    **state)
 
-    # Normalize common speech-to-text quirks
-    cleaned = (
-        spoken_time.lower()
-        .replace(".", "")
-        .replace("a m", "am")
-        .replace("p m", "pm")
-        .replace("a.m", "am")
-        .replace("p.m", "pm")
-        .replace(" o clock", "")
-        .strip()
-    )
-    print(f"[Time Normalized] Raw='{spoken_time}' → Cleaned='{cleaned}'")
 
-    # Try parsing with dateparser
-    parsed = dateparser.parse(cleaned)
-    if not parsed:
-        print(f"[Time Parsing Failed] Cleaned='{cleaned}' → Parsed=None")
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                "Could you say a specific time like 10 A.M. or 1:30 P.M.? We’re open 9 A.M. to 6 P.M.",
-                action=f"/voice/outbound/lead/time?day={day}"
-            )),
-            media_type="application/xml"
-        )
-
-    time_obj = parsed.time()
-    open_time = dt.strptime("9:00 AM", "%I:%M %p").time()
-    close_time = dt.strptime("6:00 PM", "%I:%M %p").time()
-
-    if not (open_time <= time_obj <= close_time):
-        print(f"[Time Out of Range] Parsed={time_obj}")
-        return Response(
-            str(say_and_listen(
-                VoiceResponse(),
-                "Our hours are 9 A.M. to 6 P.M. What time within those hours works for you?",
-                action=f"/voice/outbound/lead/time?day={day}"
-            )),
-            media_type="application/xml"
-        )
-
-    time_str = time_obj.strftime("%I:%M %p").lstrip("0")
-    encoded_time = quote_plus(time_str)  # encode here, not earlier
-    print(f"[Time Parsed] Final={time_str}")
-
-    return Response(
-        str(say_and_listen(
-            VoiceResponse(),
-            f"Got it. Let's get you booked for {day} at {time_str}. What's your first name?",
-            action=f"/voice/outbound/lead/intake?day={day}&time_slot={encoded_time}"
-        )),
-        media_type="application/xml"
-    )
-    
 @app.post("/voice/outbound/lead/intake")
 async def lead_intake(
     req: Request,
@@ -711,242 +764,196 @@ async def lead_intake(
     device_model: str = "",
     passcode: str = "",
     diagnostic: str = "",
-    # 🔹 extra state so mismatch correction works
     stage: str = "",
     reported_model: str = ""
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
-    print(f"[DEBUG] Intake start: day={day}, time_slot={time_slot}")
-    print(f"[Intake] day={day}, time_slot={time_slot}, first_name={first_name}, last_name={last_name}, "
-          f"phone={phone}, alt_phone={alt_phone}, email={email}, zip_code={zip_code}, referral={referral}, "
-          f"imei={imei}, device_model={device_model}, passcode={passcode}, diagnostic={diagnostic}, answer={answer}")
 
-    from urllib.parse import urlencode
+    # 1) Final "all fields complete" confirmation
+    if stage == "confirm_summary":
+        if wants_yes(answer):
+            # All fields are done, so now you can save to RepairQ or Google Sheets
+            ticket = build_lead_state(
+                day=day, time_slot=time_slot,
+                first_name=first_name, last_name=last_name,
+                phone=phone, alt_phone=alt_phone, email=email,
+                zip_code=zip_code, referral=referral,
+                imei=imei, device_model=device_model,
+                passcode=passcode, diagnostic=diagnostic
+            )
+            try:
+                save_mock_ticket(ticket)
+            except Exception as e:
+                print(f"[ERROR saving ticket] {e}")
 
-    def repeat_q(prompt, *, timeout=15, speech_timeout="auto", **kwargs):
-        # Always carry context forward
-        kwargs.setdefault("day", day)
-        kwargs.setdefault("time_slot", time_slot)
-        kwargs.setdefault("stage", stage)
-        kwargs.setdefault("reported_model", reported_model)
-        print(f"[Prompting] {prompt} | next_params={kwargs}")
-        params = urlencode(kwargs)
+            vr_final = VoiceResponse()
+            vr_final.say(f"Thanks {first_name}, you're booked for the {day} at {time_slot}. I've saved your ticket.")
+            vr_final.say("I can also answer general phone repair questions if you have any.")
+            # Optional: redirect into inbound Q&A
+            vr_final.redirect("/voice/inbound")
+            params = urlencode(ticket)
+            vr_final.redirect(f"/voice/inbound/verify?{params}")
+            return Response(str(vr_final), media_type="application/xml")
 
-        vrq = VoiceResponse()
-        vrq.say(prompt)
-        g = Gather(
-            input="speech",
-            action=f"/voice/outbound/lead/intake?{params}",
-            method="POST",
-            timeout=timeout,              # per-prompt overrideable
-            speech_timeout=speech_timeout,
-            speech_model="phone_call"
-        )
-        vrq.append(g)
-        return Response(str(vrq), media_type="application/xml")
-
-
-    # Step-by-step checks
-    if not first_name:
-        if not answer:
-            return repeat_q("What's your first name?")
-        first_name_value = extract_value(answer, "first_name")
-        if not first_name_value:
-            return repeat_q("Sorry, I didn’t catch that. Please say just your first name.")
-        return repeat_q(f"Thanks, I heard your first name is {first_name_value}. What's your last name?",
-                        first_name=first_name_value)
-
-    if not last_name:
-        if not answer:
-            return repeat_q("What's your last name?", first_name=first_name)
-        last_name_value = extract_value(answer, "last_name")
-        if not last_name_value:
-            return repeat_q("Sorry, I didn’t catch that. Please say just your last name.",
-                            first_name=first_name)
-        return repeat_q(f"Thanks, I heard your last name is {last_name_value}. What's the best phone number to reach you?",
-                        first_name=first_name, last_name=last_name_value)
-
-    if not phone:
-        if not answer:
-            return repeat_q("What's the best phone number to reach you?",
-                            first_name=first_name, last_name=last_name)
-        phone_value = extract_value(answer, "phone")
-        if not phone_value:
-            return repeat_q("Sorry, please say the phone number one digit at a time, including area code.",
-                            first_name=first_name, last_name=last_name)
-        return repeat_q(f"Thanks, I heard your phone number is {phone_value}. Do you have an alternate phone number? If not, just say no.",
-                        first_name=first_name, last_name=last_name, phone=phone_value)
-
-    if not alt_phone:
-        if not answer:
-            return repeat_q("Do you have an alternate phone number? If not, just say no.",
-                            first_name=first_name, last_name=last_name, phone=phone)
-        lower = answer.lower()
-        if any(p in lower for p in ["no", "nah", "none", "don't have", "do not have", "skip"]):
-            return repeat_q("What's your email address?",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone="")
-        alt_phone_value = extract_value(answer, "alt_phone")
-        if not alt_phone_value:
-            return repeat_q("Sorry, please say the alternate number one digit at a time, or say no if you don't have one.",
-                            first_name=first_name, last_name=last_name, phone=phone)
-        return repeat_q(f"Thanks, I heard your alternate number is {alt_phone_value}. What's your email address?",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone_value)
-
-    if not email:
-        if not answer:
-            return repeat_q("What's your email address?",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone)
-        email_value = extract_value(answer, "email")
-        if not email_value:
-            return repeat_q("Sorry, please say your email like 'name at gmail dot com'.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone)
-        return repeat_q(f"Thanks, I heard your email is {email_value}. What's your zip code?",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email_value)
-
-    if not zip_code:
-        if not answer:
-            return repeat_q("What's your zip code?",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email)
-        zip_value = extract_value(answer, "zip_code")
-        if not zip_value:
-            return repeat_q("Sorry, please say just the five-digit zip code.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email)
-        return repeat_q(f"Thanks. How did you hear about us?",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_value)
-
-    if not referral:
-        if not answer:
-            return repeat_q("How did you hear about us?",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code)
-        referral_value = extract_value(answer, "referral") or answer
-        return repeat_q("Can you provide the device IMEI? If not, just say no.",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral_value)
-
-    if stage == "confirm_device_model":
-        lower = answer.lower()
-        if any(p in lower for p in ["yes", "correct", "that's right"]):
-            # Accept API-reported model
-            return repeat_q("Do you have a passcode for the device? If not, say no.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code, referral=referral,
-                            imei=imei, device_model=reported_model)
-        else:
-            # Capture corrected model from caller
-            corrected_model = extract_value(answer, "device_model") or answer
-            return repeat_q(f"Thanks, updated to {corrected_model}. Do you have a passcode for the device? If not, say no.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code, referral=referral,
-                            imei=imei, device_model=corrected_model)
-    
-    if not imei:
-        lower = answer.lower()
-        digits_only = extract_value(answer, "imei")  # returns 15 digits or ""
-
-        # Skip IMEI if caller doesn't have it
-        if any(phrase in lower for phrase in [
-            "no", "nah", "none", "don't have", "do not have", "not available", "skip"
-        ]):
-            return repeat_q("No problem. Do you have a passcode for the device? If not, say no.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
-
-        # Stall phrases — be patient and re-ask with longer timeout
-        if any(phrase in lower for phrase in [
-            "hold on", "hang on", "give me a minute", "one sec", "just a second"
-        ]):
-            return repeat_q("Sure, take your time. When you're ready, please read out the fifteen-digit I M E I number clearly, digit by digit.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code, referral=referral, imei="", device_model="",
-                            timeout=12, speech_timeout="auto")
-
-        # Valid 15-digit IMEI — check with API
-        if len(digits_only) == 15:
-            imei_info = imei_lookup(digits_only)  # your helper
-            reported_model = imei_info.get("model", "").strip()
-
-            if reported_model:
-                if device_model and reported_model.lower() != device_model.lower():
-                    # Mismatch — confirm with customer
-                    return repeat_q(
-                        f"I checked the IMEI and it shows {reported_model}. "
-                        f"You mentioned {device_model}. Is {reported_model} correct?",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral,
-                        imei=digits_only, device_model=device_model,
-                        reported_model=reported_model, stage="confirm_device_model"
-                    )
-                else:
-                    spoken = ", ".join(digits_only)
-                    return repeat_q(
-                        f"Got it. I heard {spoken} and it matches {reported_model}. "
-                        "Do you have a passcode for the device? If not, say no.",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral,
-                        imei=digits_only, device_model=reported_model
-                    )
-            else:
-                # API returned nothing — proceed
-                spoken = ", ".join(digits_only)
-                return repeat_q(
-                    f"Got it. I heard {spoken}. Do you have a passcode for the device? If not, say no.",
-                    first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                    email=email, zip_code=zip_code, referral=referral,
-                    imei=digits_only, device_model=device_model
+        if wants_no(answer):
+            return repeat_q(
+                "Which field do you want to change? For example: day, time, email, or device model.",
+                action_path="/voice/outbound/lead/intake",
+                stage="correction_target",
+                **build_lead_state(
+                    day=day, time_slot=time_slot,
+                    first_name=first_name, last_name=last_name,
+                    phone=phone, alt_phone=alt_phone, email=email,
+                    zip_code=zip_code, referral=referral,
+                    imei=imei, device_model=device_model,
+                    passcode=passcode, diagnostic=diagnostic
                 )
+            )
 
-        # Incomplete or unclear — give more time and clear instruction
-        return repeat_q("I only heard part of the number. Please read your complete fifteen-digit I M E I number, digit by digit.",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral, imei="", device_model="",
-                        timeout=12, speech_timeout="auto")
-    if not passcode:
-        lower = answer.lower()
-        passcode_value = "" if any(p in lower for p in ["no", "nah", "none", "skip"]) else answer
-        # For privacy, don't read passcode aloud
-        return repeat_q("Thanks. Briefly describe the issue with the device.",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral,
-                        imei=imei, device_model=device_model, passcode=passcode_value)
+        # Neither a clear yes nor no → re-read summary
+        return repeat_q(
+            read_back_summary(build_lead_state(
+                day=day, time_slot=time_slot,
+                first_name=first_name, last_name=last_name,
+                phone=phone, alt_phone=alt_phone, email=email,
+                zip_code=zip_code, referral=referral,
+                imei=imei, device_model=device_model,
+                passcode=passcode, diagnostic=diagnostic
+            )),
+            action_path="/voice/outbound/lead/intake",
+            stage="confirm_summary",
+            **build_lead_state(
+                day=day, time_slot=time_slot,
+                first_name=first_name, last_name=last_name,
+                phone=phone, alt_phone=alt_phone, email=email,
+                zip_code=zip_code, referral=referral,
+                imei=imei, device_model=device_model,
+                passcode=passcode, diagnostic=diagnostic
+            )
+        )
 
-    if not diagnostic:
-        diagnostic_value = answer
-        ticket = {
-            "day": day,
-            "time_slot": time_slot,
-            "first_name": first_name,
-            "last_name": last_name,
-            "phone": phone,
-            "alt_phone": alt_phone,
-            "email": email,
-            "zip_code": zip_code,
-            "referral": referral,
-            "imei": imei,
-            "device_model": device_model,
-            "passcode": passcode,
-            "diagnostic": diagnostic_value
+    # 1) Final "all fields complete" confirmation
+    if stage == "confirm_summary":
+        lead_state = build_lead_state(
+            day=day, time_slot=time_slot,
+            first_name=first_name, last_name=last_name,
+            phone=phone, alt_phone=alt_phone, email=email,
+            zip_code=zip_code, referral=referral,
+            imei=imei, device_model=device_model,
+            passcode=passcode, diagnostic=diagnostic
+        )
+
+        if wants_yes(answer):
+            # Save the completed ticket to RepairQ or Google Sheets
+            try:
+                save_mock_ticket(lead_state)
+            except Exception as e:
+                print(f"[ERROR saving ticket] {e}")
+
+            # Thank caller & transition into post‑booking Q&A
+            vr_final = VoiceResponse()
+            vr_final.say(
+                f"Thanks {lead_state['first_name']}, you're booked for the "
+                f"{lead_state['day']} at {lead_state['time_slot']}. I've saved your ticket."
+            )
+            vr_final.say("I can also answer general phone repair questions if you have any.")
+            params = urlencode(lead_state)
+            vr_final.redirect(f"/voice/inbound/verify?{params}")
+            return Response(str(vr_final), media_type="application/xml")
+
+        if wants_no(answer):
+            return repeat_q(
+                "Which field do you want to change? For example: day, time, email, or device model.",
+                action_path="/voice/outbound/lead/intake",
+                stage="correction_target",
+                **lead_state
+            )
+
+        # Unclear answer → re‑read the summary
+        return repeat_q(
+            read_back_summary(lead_state),
+            action_path="/voice/outbound/lead/intake",
+            stage="confirm_summary",
+            **lead_state
+        )
+
+    # 2) Field‑level correction target
+    if stage == "correction_target":
+        field_map = {
+            "day": "day", "date": "day",
+            "time": "time_slot", "time slot": "time_slot",
+            "first": "first_name", "first name": "first_name",
+            "last": "last_name", "last name": "last_name",
+            "phone": "phone", "primary": "phone",
+            "alternate": "alt_phone", "alt": "alt_phone",
+            "email": "email",
+            "zip": "zip_code", "zip code": "zip_code",
+            "referral": "referral",
+            "imei": "imei",
+            "model": "device_model", "device": "device_model",
+            "passcode": "passcode", "code": "passcode",
+            "diagnostic": "diagnostic", "issue": "diagnostic"
         }
-        print(f"[Ticket Complete] {ticket}")
-        try:
-            save_mock_ticket(ticket)
-            print("[Ticket saved to Google Sheets]")
-        except Exception as e:
-            print(f"[ERROR saving ticket] {e}")
+        key = (answer or "").lower().strip()
+        target = field_map.get(key)
+        if not target:
+            for k, v in field_map.items():
+                if k in key:
+                    target = v
+                    break
 
-        vr_final = VoiceResponse()
-        vr_final.say(f"Thanks {first_name}, you're booked for the {day} at {time_slot}. I've saved your ticket.")
-        vr_final.say("I can also answer general phone repair questions if you have any.")
-        vr_final.redirect("/voice/inbound")
+        lead_state = build_lead_state(
+            day=day, time_slot=time_slot,
+            first_name=first_name, last_name=last_name,
+            phone=phone, alt_phone=alt_phone, email=email,
+            zip_code=zip_code, referral=referral,
+            imei=imei, device_model=device_model,
+            passcode=passcode, diagnostic=diagnostic
+        )
 
-        params = urlencode(ticket)
-        vr_final.redirect(f"/voice/inbound/verify?{params}")
-        return Response(str(vr_final), media_type="application/xml")
+        if not target:
+            return repeat_q(
+                "Sorry, which field should I change? For example say: day, time, email, phone, or device model.",
+                action_path="/voice/outbound/lead/intake",
+                stage="correction_target",
+                **lead_state
+            )
 
-    # Failsafe
-    return repeat_q("Sorry, I didn’t catch that. Could you repeat?")
+        # Ask for the new value
+        return repeat_q(
+            f"Okay, what's the correct {target.replace('_', ' ')}?",
+            action_path="/voice/outbound/lead/intake",
+            stage=target,
+            **lead_state
+        )
+
+    # 3) Core progression — ask next missing field, or reach summary if all done
+    result = handle_field_progression(
+        answer=answer,
+        stage=stage,
+        reported_model=reported_model,
+        day=day, time_slot=time_slot,
+        first_name=first_name, last_name=last_name,
+        phone=phone, alt_phone=alt_phone, email=email,
+        zip_code=zip_code, referral=referral,
+        imei=imei, device_model=device_model,
+        passcode=passcode, diagnostic=diagnostic
+    )
+    if result and result.get("prompt") and result.get("lead_state"):
+        return repeat_q(
+            result["prompt"],
+            action_path="/voice/outbound/lead/intake",
+            stage=result.get("stage", ""),
+            reported_model=result.get("reported_model", reported_model),
+            timeout=result.get("timeout", 15),
+            speech_timeout=result.get("speech_timeout", "auto"),
+            **result["lead_state"]
+        )
+    
+# 4) Failsafe — only runs if we somehow fall through all above
+    return repeat_q("Sorry, I didn’t catch that. Could you repeat?",
+                    action_path="/voice/outbound/lead/intake")
 
 # === NEW: General phone repair Q&A after booking ===
 @app.post("/voice/inbound")
@@ -956,9 +963,10 @@ async def voice_inbound(req: Request):
     answer = (form.get("SpeechResult") or "").strip()
     print(f"[Inbound Q&A] answer={answer}")
 
+    vr = VoiceResponse()
+
     # First turn – greet and invite a question
     if not answer:
-        vr = VoiceResponse()
         g = Gather(
             input="speech",
             action="/voice/inbound",
@@ -972,7 +980,6 @@ async def voice_inbound(req: Request):
         return Response(str(vr), media_type="application/xml")
 
     lower = answer.lower()
-    vr = VoiceResponse()
 
     # Quick fixed answers for common topics
     if "hour" in lower:
@@ -982,7 +989,7 @@ async def voice_inbound(req: Request):
     elif "how long" in lower or "long" in lower or "turnaround" in lower:
         vr.say("We usually quote repairs at 1 to 2 hours once we begin work.")
     else:
-        # Hand off to your existing AI repair Q&A flow
+        # Hand off to your AI repair Q&A flow (already implemented in /voice/inbound/process)
         vr.redirect("/voice/inbound/process")
         return Response(str(vr), media_type="application/xml")
 
@@ -993,193 +1000,136 @@ async def voice_inbound(req: Request):
 @app.post("/voice/inbound/verify")
 async def inbound_verify(
     req: Request,
-    # Seeded from booking
     day: str = "", time_slot: str = "",
     first_name: str = "", last_name: str = "",
-    phone: str = "", email: str = "",
-    device_model: str = "", diagnostic: str = "",
-    imei: str = "",
-    stage: str = "intro"  # intro, name, last, phone, email, device, diag_add, imei, done
+    phone: str = "", alt_phone: str = "", email: str = "",
+    zip_code: str = "", referral: str = "",
+    imei: str = "", device_model: str = "",
+    passcode: str = "", diagnostic: str = "",
+    stage: str = "",
+    reported_model: str = ""
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
-    print(f"[Verify] stage={stage} answer={answer} | state={{'first': '{first_name}', 'last': '{last_name}', 'phone': '{phone}', 'email': '{email}', 'device': '{device_model}', 'diag': '{diagnostic}', 'imei': '{imei}'}}")
 
-    def ask(next_stage: str, prompt: str, **state):
-        # Always allow patient pauses
-        params = urlencode({**state, "stage": next_stage})
-        vr = VoiceResponse()
-        g = Gather(
-            input="speech",
-            action=f"/voice/inbound/verify?{params}",
-            method="POST",
-            timeout=30,
-            speech_timeout="auto",
-            speech_model="phone_call"
+    lead_state = build_lead_state(
+        day=day, time_slot=time_slot,
+        first_name=first_name, last_name=last_name,
+        phone=phone, alt_phone=alt_phone, email=email,
+        zip_code=zip_code, referral=referral,
+        imei=imei, device_model=device_model,
+        passcode=passcode, diagnostic=diagnostic
+    )
+
+    # Handle correction stage (user wants to change a specific field)
+    if stage == "correction_target":
+        field_map = {
+            "day": "day", "date": "day",
+            "time": "time_slot", "time slot": "time_slot",
+            "first": "first_name", "first name": "first_name",
+            "last": "last_name", "last name": "last_name",
+            "phone": "phone", "primary": "phone",
+            "alternate": "alt_phone", "alt": "alt_phone",
+            "email": "email",
+            "zip": "zip_code", "zip code": "zip_code",
+            "referral": "referral",
+            "imei": "imei",
+            "model": "device_model", "device": "device_model",
+            "passcode": "passcode", "code": "passcode",
+            "diagnostic": "diagnostic", "issue": "diagnostic"
+        }
+        key = (answer or "").lower().strip()
+        target = field_map.get(key)
+        if not target:
+            for k, v in field_map.items():
+                if k in key:
+                    target = v
+                    break
+        if not target:
+            return repeat_q(
+                "Sorry, which field should I change?",
+                action_path="/voice/inbound/verify",
+                stage="correction_target",
+                timeout=30, speech_timeout="auto",
+                **lead_state
+            )
+        return repeat_q(
+            f"Okay, what's the correct {target.replace('_', ' ')}?",
+            action_path="/voice/inbound/verify",
+            stage=target,
+            timeout=30, speech_timeout="auto",
+            **lead_state
         )
-        g.say(prompt)
-        vr.append(g)
-        return Response(str(vr), media_type="application/xml")
 
-    # Intro summary and start
-    if stage == "intro":
-        summary = []
-        if first_name or last_name: summary.append(f"name {first_name} {last_name}".strip())
-        if phone: summary.append(f"phone {format_phone_usa(phone)}")
-        if email: summary.append(f"email {normalize_email(email)}")
-        if device_model: summary.append(f"device {device_model}")
-        if diagnostic: summary.append(f"issue {diagnostic}")
-        intro_msg = "I’ll quickly verify your details. " + (". ".join(summary) + "." if summary else "")
-        return ask("name", f"{intro_msg} Is your first name still {first_name or 'unknown'}? You can say yes or say your first name.", 
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+    # First time in? Read back summary
+    if not stage:
+        return repeat_q(
+            read_back_summary(lead_state),
+            action_path="/voice/inbound/verify",
+            stage="confirm_summary",
+            timeout=30, speech_timeout="auto",
+            **lead_state
+        )
 
-    # First name
-    if stage == "name":
-        low = answer.lower()
-        if low in ("yes", "yeah", "yep", "correct") and first_name:
-            return ask("last", f"Great. Is your last name still {last_name or 'unknown'}? You can say yes or say your last name.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        # Treat any other non-empty answer as replacement
-        if answer:
-            return ask("last", f"Thanks {answer}. Is your last name still {last_name or 'unknown'}? You can say yes or say your last name.",
-                       day=day, time_slot=time_slot, first_name=answer, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        return ask("name", "Sorry, what’s your first name?",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    # Last name
-    if stage == "last":
-        low = answer.lower()
-        if low in ("yes", "yeah", "yep", "correct") and last_name:
-            return ask("phone", f"I have your phone as {format_phone_usa(phone)}. Is that correct? You can say yes or give a different number.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        if answer:
-            return ask("phone", f"Got it, {answer}. Now, I have your phone as {format_phone_usa(phone)}. Is that correct?",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=answer, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        return ask("last", "Sorry, what’s your last name?",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    # Phone with 10-digit requirement
-    if stage == "phone":
-        low = answer.lower()
-        if low in ("yes", "yeah", "yep", "correct") and is_valid_phone(phone):
-            return ask("email", f"I have your email as {normalize_email(email)}. Is that correct? You can say yes or give a different email.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        if answer:
-            new_digits = normalize_phone(answer)
-            if is_valid_phone(new_digits):
-                pretty = format_phone_usa(new_digits)
-                return ask("email", f"Thanks. I’ll use {pretty}. Is your email still {normalize_email(email) or 'unknown'}?",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=new_digits, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-            return ask("phone", "I didn’t get a 10 digit phone number. Please say it digit by digit.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        return ask("phone", "What’s the best phone number to reach you? Please say it digit by digit.",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    # Email with simple pattern
-    if stage == "email":
-        low = answer.lower()
-        if low in ("yes", "yeah", "yep", "correct") and is_valid_email(email):
-            return ask("device", f"I have your device as {device_model or 'unknown'}. Is that correct? You can say yes or say the model.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        if answer:
-            new_email = normalize_email(answer)
-            if is_valid_email(new_email):
-                return ask("device", f"Thanks. I’ll use {new_email}. Is your device still {device_model or 'unknown'}?",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=new_email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-            return ask("email", "That email didn’t look right. Please say it like user at gmail dot com.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        return ask("email", "What’s the best email to reach you?",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    # Device model using curated list and suggestion
-    if stage == "device":
-        low = answer.lower()
-        if low in ("yes", "yeah", "yep", "correct") and device_model:
-            return ask("diag_add", f"I have your issue as {diagnostic or 'not set'}. Would you like to add more detail?",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        if answer:
-            # Exact match first
-            exact = next((m for m in ALL_DEVICE_MODELS if m.lower() == answer.lower()), None)
-            if exact:
-                return ask("diag_add", f"Got it, {exact}. Your issue is {diagnostic or 'not set'}. Add more detail?",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=exact, diagnostic=diagnostic, imei=imei)
-            # Suggest close matches
-            suggestions = suggest_device_models(answer, limit=3)
-            if suggestions:
-                opts = "; ".join(suggestions)
-                return ask("device_choice", f"I heard {answer}. Did you mean {opts}? Please say the exact one.",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-            # No good suggestion, ask again
-            return ask("device", "Could you say the device model again, like iPhone 13 or Galaxy S22 Ultra?",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        return ask("device", "What device model is it?",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    if stage == "device_choice":
-        # Accept any of the suggestions verbatim if they repeat it
-        if answer:
-            match = next((m for m in ALL_DEVICE_MODELS if m.lower() == answer.lower()), None)
-            if match:
-                return ask("diag_add", f"Thanks. Your device is {match}. Would you like to add more detail to the issue?",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=match, diagnostic=diagnostic, imei=imei)
-        return ask("device", "No problem. What device model is it?",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    # Append diagnostic if desired
-    if stage == "diag_add":
-        low = answer.lower()
-        if low in ("no", "nah", "nope", "skip"):
-            return ask("imei", "If you have the device IMEI number, you can say it now. Otherwise say skip.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        if answer:
-            new_diag = f"{diagnostic}; {answer}" if diagnostic else answer
-            return ask("imei", "Thanks. If you have the device IMEI number, say it now. Otherwise say skip.",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=new_diag, imei=imei)
-        return ask("diag_add", "You can add any extra details about the issue, or say skip.",
-                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-
-    # IMEI optional with validation and soft lookup
-    if stage == "imei":
-        low = answer.lower()
-        if low in ("skip", "no", "nah", "nope", ""):
-            # Done, move to Q&A
-            return ask("done", "All set. I can answer general phone repair questions now. What would you like to know?",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-        if answer:
-            raw = re.sub(r"\D", "", answer)
-            if not is_valid_imei(raw):
-                return ask("imei", "That didn’t sound like a valid IMEI. It should be 15 digits. You can try again or say skip.",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
-            # Optional checker, non-blocking
-            checked_model = None
+    # Summary confirmation
+    if stage == "confirm_summary":
+        if wants_yes(answer):
             try:
-                checked = imei_lookup(raw)  # implement or integrate as needed
-                checked_model = (checked.get("brand", "") + " " + checked.get("model", "")).strip()
+                save_mock_ticket(lead_state)  # Google Sheets / RepairQ push
             except Exception as e:
-                print(f"[IMEI Lookup ERROR] {e}")
-            if checked_model and device_model and checked_model.lower() != device_model.lower():
-                return ask("device", f"I found {checked_model} for that IMEI, which is different from {device_model}. Would you like to update the device model? Say the correct model, or say keep.",
-                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=raw)
-            # Accept and proceed
-            return ask("done", "Thanks. IMEI added. I can answer general phone repair questions now. What would you like to know?",
-                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=raw)
+                print(f"[ERROR saving ticket] {e}")
+            vr_final = VoiceResponse()
+            vr_final.say("Thanks, your booking is confirmed.")
+            vr_final.say("Would you like to ask any other questions?")
+            vr_final.redirect("/voice/inbound")
+            return Response(str(vr_final), media_type="application/xml")
+        if wants_no(answer):
+            return repeat_q(
+                "Which field would you like to change?",
+                action_path="/voice/inbound/verify",
+                stage="correction_target",
+                timeout=30, speech_timeout="auto",
+                **lead_state
+            )
+        return repeat_q(
+            read_back_summary(lead_state),
+            action_path="/voice/inbound/verify",
+            stage="confirm_summary",
+            timeout=30, speech_timeout="auto",
+            **lead_state
+        )
 
-    if stage == "done":
-        # Hand off to your AI Q&A flow
-        vr = VoiceResponse()
-        params = urlencode({
-            "day": day, "time_slot": time_slot,
-            "first_name": first_name, "last_name": last_name,
-            "phone": phone, "email": email,
-            "device_model": device_model, "diagnostic": diagnostic, "imei": imei
-        })
-        vr.redirect(f"/voice/inbound/process?{params}")
-        return Response(str(vr), media_type="application/xml")
+    # Otherwise, let the AI progression handle any remaining/missing fields
+    result = handle_field_progression(
+        answer=answer,
+        stage=stage,
+        reported_model=reported_model,
+        **lead_state
+    )
 
-    # Unknown stage fallback
-    return ask("intro", "Let’s verify your details.",
-               day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+    # Save progress on every update
+    try:
+        save_mock_ticket(result["lead_state"])
+    except Exception as e:
+        print(f"[ERROR saving progress] {e}")
 
+    if result and result.get("prompt"):
+        return repeat_q(
+            result["prompt"],
+            action_path="/voice/inbound/verify",
+            stage=result.get("stage", ""),
+            reported_model=result.get("reported_model", reported_model),
+            timeout=30, speech_timeout="auto",
+            **result["lead_state"]
+        )
+
+    # Failsafe
+    return repeat_q(
+        "Sorry, I didn’t catch that. Could you repeat?",
+        action_path="/voice/inbound/verify",
+        timeout=30, speech_timeout="auto",
+        **lead_state
+    )
 
 # Health check
 @app.get("/health")
