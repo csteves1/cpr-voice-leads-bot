@@ -503,6 +503,12 @@ def schedule_lead_call(lead):
 
 @app.post("/webhooks/repairq/lead")
 async def repairq_lead(req: Request):
+    # ✅ Safeguard: check Twilio number is set before scheduling
+    twilio_num = os.getenv("TWILIO_NUMBER")
+    if not twilio_num:
+        print("[ERROR] TWILIO_NUMBER env var is missing or empty — skipping outbound call")
+        return {"ok": False, "error": "Missing Twilio number in server environment"}
+
     payload = await req.json()
     lead = {
         "name": payload.get("name", ""),
