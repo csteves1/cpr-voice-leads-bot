@@ -12,7 +12,28 @@ from google.oauth2 import service_account
 from datetime import datetime as dt, timedelta
 import dateparser
 from urllib.parse import quote_plus
+from urllib.parse import urlencode
 
+def repeat_q(prompt, day="", time_slot="", **kwargs):
+    # Preserve booking day/time slot unless overridden
+    kwargs.setdefault("day", day)
+    kwargs.setdefault("time_slot", time_slot)
+    print(f"[Prompting] {prompt} | next_params={kwargs}")
+
+    params = urlencode(kwargs)
+
+    vrq = VoiceResponse()
+    vrq.say(prompt)
+    g = Gather(
+        input="speech",
+        action=f"/voice/outbound/lead/intake?{params}",
+        method="POST",
+        timeout=30,
+        speech_timeout="auto",
+        speech_model="phone_call"
+    )
+    vrq.append(g)
+    return Response(str(vrq), media_type="application/xml")
 def norm_text(s: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
 
@@ -23,6 +44,64 @@ STORE_INFO = {
     "phone": "(843) 750-0449",
     "hours": "Monday to Saturday 9am-6pm, Sunday we are closed",
 }
+
+# Popular device models for validation and suggestions
+DEVICE_MODELS = {
+    "apple": [
+        # iPhone
+        "iPhone 6", "iPhone 6 Plus", "iPhone 6s", "iPhone 6s Plus",
+        "iPhone 7", "iPhone 7 Plus", "iPhone 8", "iPhone 8 Plus",
+        "iPhone X", "iPhone XR", "iPhone XS", "iPhone XS Max",
+        "iPhone 11", "iPhone 11 Pro", "iPhone 11 Pro Max",
+        "iPhone SE 2nd Gen", "iPhone SE 3rd Gen",
+        "iPhone 12 Mini", "iPhone 12", "iPhone 12 Pro", "iPhone 12 Pro Max",
+        "iPhone 13 Mini", "iPhone 13", "iPhone 13 Pro", "iPhone 13 Pro Max",
+        "iPhone 14", "iPhone 14 Plus", "iPhone 14 Pro", "iPhone 14 Pro Max",
+        "iPhone 15", "iPhone 15 Plus", "iPhone 15 Pro", "iPhone 15 Pro Max",
+        # iPad
+        "iPad 6th Gen", "iPad 7th Gen", "iPad 8th Gen", "iPad 9th Gen", "iPad 10th Gen",
+        "iPad Air 3", "iPad Air 4", "iPad Air 5",
+        "iPad Mini 5", "iPad Mini 6",
+        "iPad Pro 9.7", "iPad Pro 10.5",
+        "iPad Pro 11 1st Gen", "iPad Pro 11 2nd Gen", "iPad Pro 11 3rd Gen", "iPad Pro 11 4th Gen",
+        "iPad Pro 12.9 2nd Gen", "iPad Pro 12.9 3rd Gen", "iPad Pro 12.9 4th Gen", "iPad Pro 12.9 5th Gen", "iPad Pro 12.9 6th Gen"
+    ],
+    "samsung": [
+        # S series
+        "Galaxy S8", "Galaxy S8 Plus", "Galaxy S9", "Galaxy S9 Plus",
+        "Galaxy S10e", "Galaxy S10", "Galaxy S10 Plus",
+        "Galaxy S20", "Galaxy S20 Plus", "Galaxy S20 Ultra",
+        "Galaxy S21", "Galaxy S21 Plus", "Galaxy S21 Ultra",
+        "Galaxy S22", "Galaxy S22 Plus", "Galaxy S22 Ultra",
+        "Galaxy S23", "Galaxy S23 Plus", "Galaxy S23 Ultra",
+        "Galaxy S24", "Galaxy S24 Plus", "Galaxy S24 Ultra",
+        # Note
+        "Galaxy Note 8", "Galaxy Note 9", "Galaxy Note 10", "Galaxy Note 10 Plus",
+        "Galaxy Note 20", "Galaxy Note 20 Ultra",
+        # A series
+        "Galaxy A10e", "Galaxy A12", "Galaxy A13", "Galaxy A32", "Galaxy A42", "Galaxy A51", "Galaxy A52", "Galaxy A53", "Galaxy A54",
+        # Foldables
+        "Galaxy Z Flip 3", "Galaxy Z Flip 4", "Galaxy Z Flip 5",
+        "Galaxy Z Fold 3", "Galaxy Z Fold 4", "Galaxy Z Fold 5"
+    ],
+    "lg": [
+        "LG G4", "LG G5", "LG G6", "LG G7 ThinQ", "LG G8 ThinQ",
+        "LG V20", "LG V30", "LG V35", "LG V40", "LG V50", "LG V60",
+        "LG Stylo 4", "LG Stylo 5", "LG Stylo 6",
+        "LG K40", "LG K51", "LG K92"
+    ],
+    "motorola": [
+        "Moto G5", "Moto G6", "Moto G7",
+        "Moto G Power 2020", "Moto G Power 2021", "Moto G Power 2022", "Moto G Power 2023",
+        "Moto G Stylus 2020", "Moto G Stylus 2021", "Moto G Stylus 2022", "Moto G Stylus 2023",
+        "Moto G Pure", "Moto G Play",
+        "Moto Edge 2021", "Moto Edge 2022", "Moto Edge 2023", "Moto Edge Plus 2023",
+        "Moto One 5G", "Moto One 5G Ace"
+    ]
+}
+
+# Flattened list for quick search
+ALL_DEVICE_MODELS = [m for brand in DEVICE_MODELS.values() for m in brand]
 
 app = FastAPI()
 
@@ -39,6 +118,89 @@ def say_and_listen(vr: VoiceResponse, text: str, action="/voice/inbound/process"
     )
     vr.append(g)
     return vr
+
+import re
+from urllib.parse import urlencode
+
+DIGIT_WORDS = {
+    "zero": "0", "oh": "0", "o": "0",
+    "one": "1", "two": "2", "three": "3", "four": "4",
+    "five": "5", "six": "6", "seven": "7", "eight": "8", "nine": "9"
+}
+
+def normalize_digits_spoken(s: str) -> str:
+    # Handle "eight four three ..." and trailing punctuation
+    w = re.sub(r"[^\w\s@.+-]", "", (s or "").lower())
+    tokens = w.split()
+    out = []
+    for t in tokens:
+        out.append(DIGIT_WORDS.get(t, t))
+    return "".join(out)
+
+def normalize_phone(s: str) -> str:
+    digits = re.sub(r"\D", "", normalize_digits_spoken(s))
+    if len(digits) == 11 and digits.startswith("1"):
+        digits = digits[1:]
+    return digits
+
+def is_valid_phone(s: str) -> bool:
+    return len(normalize_phone(s)) == 10
+
+def format_phone_usa(s: str) -> str:
+    d = normalize_phone(s)
+    return f"({d[0:3]}) {d[3:6]}-{d[6:10]}" if len(d) == 10 else s
+
+def normalize_email(s: str) -> str:
+    e = (s or "").strip().rstrip(".").lower()
+    return re.sub(r"\s+", "", e)
+
+def is_valid_email(e: str) -> bool:
+    e = normalize_email(e)
+    return re.match(r"^[^@]+@[^@]+\.[a-z]{2,}$", e, re.I) is not None
+
+def luhn_checksum(number: str) -> int:
+    digits = [int(d) for d in number if d.isdigit()]
+    checksum = 0
+    parity = len(digits) % 2
+    for i, d in enumerate(digits):
+        if i % 2 == parity:
+            d *= 2
+            if d > 9:
+                d -= 9
+        checksum += d
+    return checksum % 10
+
+def is_valid_imei(s: str) -> bool:
+    digits = re.sub(r"\D", "", s or "")
+    return len(digits) == 15 and luhn_checksum(digits) == 0
+
+def suggest_device_models(user_text: str, limit: int = 5):
+    """Lightweight fuzzy match by token overlap and substring presence."""
+    q = (user_text or "").lower().strip()
+    if not q:
+        return []
+    q_tokens = set(re.findall(r"[a-z0-9]+", q))
+    scored = []
+    for m in ALL_DEVICE_MODELS:
+        m_lower = m.lower()
+        m_tokens = set(re.findall(r"[a-z0-9]+", m_lower))
+        overlap = len(q_tokens & m_tokens)
+        score = overlap + (1 if q in m_lower or m_lower in q else 0)
+        if score > 0:
+            scored.append((score, m))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [m for _, m in scored[:limit]]
+
+def imei_lookup(imei: str) -> dict:
+    """
+    Placeholder IMEI lookup.
+    Replace this with a real API call to an IMEI checking service.
+    Should return a dict like:
+        {"brand": "Apple", "model": "iPhone 13", "status": "Clean"}
+    """
+    # TODO: integrate with a real IMEI API
+    # For now, just return empty so the flow can continue
+    return {}
 
 # --- Secure Google Sheets helpers ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
@@ -179,19 +341,61 @@ async def voice_process(req: Request):
             media_type="application/xml"
         )
 
-        # This is the end of the /voice/inbound/process route handler.
-        # No additional code is needed here.
+from datetime import datetime, timedelta
+import pytz
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
+
+EASTERN = pytz.timezone("US/Eastern")
+
+# Persistent job store (SQLite file in your project dir)
+jobstores = {
+    'default': SQLAlchemyJobStore(url='sqlite:///scheduled_jobs.sqlite')
+}
+
+scheduler = BackgroundScheduler(jobstores=jobstores, timezone=EASTERN)
+scheduler.start()
+
+def should_call_now():
+    now = datetime.now(EASTERN)
+    start = now.replace(hour=10, minute=0, second=0, microsecond=0)
+    end = now.replace(hour=18, minute=0, second=0, microsecond=0)
+    return start <= now <= end
+
+def schedule_lead_call(lead):
+    now = datetime.now(EASTERN)
+    if should_call_now():
+        print("[Lead Call] Within business hours — calling immediately.")
+        start_outbound_call(lead)
+    else:
+        # Figure next 10 AM Eastern
+        if now.hour >= 18:
+            next_call_time = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
+        else:  # before 10 AM
+            next_call_time = now.replace(hour=10, minute=0, second=0, microsecond=0)
+
+        print(f"[Lead Call] Outside business hours — scheduling for {next_call_time.isoformat()}")
+        job_id = f"lead_call_{lead.get('phone','')}_{int(next_call_time.timestamp())}"
+        scheduler.add_job(
+            start_outbound_call,
+            'date',
+            run_date=next_call_time,
+            args=[lead],
+            id=job_id,
+            replace_existing=True
+        )
+
 @app.post("/webhooks/repairq/lead")
 async def repairq_lead(req: Request):
     payload = await req.json()
     lead = {
-        "name": payload.get("name",""),
-        "phone": payload.get("phone",""),
-        "device": payload.get("device",""),
-        "repair_type": payload.get("repair_type",""),
-        "source": payload.get("source","online_lead"),
+        "name": payload.get("name", ""),
+        "phone": payload.get("phone", ""),
+        "device": payload.get("device", ""),
+        "repair_type": payload.get("repair_type", ""),
+        "source": payload.get("source", "online_lead"),
     }
-    start_outbound_call(lead)
+    schedule_lead_call(lead)
     return {"ok": True}
 
 @app.post("/voice/outbound/lead")
@@ -501,6 +705,9 @@ async def lead_intake(
         vr_final.say(f"Thanks {first_name}, you're booked for the {day} at {time_slot}. I've saved your ticket.")
         vr_final.say("I can also answer general phone repair questions if you have any.")
         vr_final.redirect("/voice/inbound")
+        
+        params = urlencode(ticket)
+        vr_final.redirect(f"/voice/inbound/verify?{params}")
         return Response(str(vr_final), media_type="application/xml")
 
         # Failsafe
@@ -547,6 +754,197 @@ async def voice_inbound(req: Request):
     # After answering, loop back so they can ask more
     vr.redirect("/voice/inbound")
     return Response(str(vr), media_type="application/xml")
+
+@app.post("/voice/inbound/verify")
+async def inbound_verify(
+    req: Request,
+    # Seeded from booking
+    day: str = "", time_slot: str = "",
+    first_name: str = "", last_name: str = "",
+    phone: str = "", email: str = "",
+    device_model: str = "", diagnostic: str = "",
+    imei: str = "",
+    stage: str = "intro"  # intro, name, last, phone, email, device, diag_add, imei, done
+):
+    form = await req.form()
+    answer = (form.get("SpeechResult") or "").strip()
+    print(f"[Verify] stage={stage} answer={answer} | state={{'first': '{first_name}', 'last': '{last_name}', 'phone': '{phone}', 'email': '{email}', 'device': '{device_model}', 'diag': '{diagnostic}', 'imei': '{imei}'}}")
+
+    def ask(next_stage: str, prompt: str, **state):
+        # Always allow patient pauses
+        params = urlencode({**state, "stage": next_stage})
+        vr = VoiceResponse()
+        g = Gather(
+            input="speech",
+            action=f"/voice/inbound/verify?{params}",
+            method="POST",
+            timeout=30,
+            speech_timeout="auto",
+            speech_model="phone_call"
+        )
+        g.say(prompt)
+        vr.append(g)
+        return Response(str(vr), media_type="application/xml")
+
+    # Intro summary and start
+    if stage == "intro":
+        summary = []
+        if first_name or last_name: summary.append(f"name {first_name} {last_name}".strip())
+        if phone: summary.append(f"phone {format_phone_usa(phone)}")
+        if email: summary.append(f"email {normalize_email(email)}")
+        if device_model: summary.append(f"device {device_model}")
+        if diagnostic: summary.append(f"issue {diagnostic}")
+        intro_msg = "I’ll quickly verify your details. " + (". ".join(summary) + "." if summary else "")
+        return ask("name", f"{intro_msg} Is your first name still {first_name or 'unknown'}? You can say yes or say your first name.", 
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # First name
+    if stage == "name":
+        low = answer.lower()
+        if low in ("yes", "yeah", "yep", "correct") and first_name:
+            return ask("last", f"Great. Is your last name still {last_name or 'unknown'}? You can say yes or say your last name.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        # Treat any other non-empty answer as replacement
+        if answer:
+            return ask("last", f"Thanks {answer}. Is your last name still {last_name or 'unknown'}? You can say yes or say your last name.",
+                       day=day, time_slot=time_slot, first_name=answer, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        return ask("name", "Sorry, what’s your first name?",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # Last name
+    if stage == "last":
+        low = answer.lower()
+        if low in ("yes", "yeah", "yep", "correct") and last_name:
+            return ask("phone", f"I have your phone as {format_phone_usa(phone)}. Is that correct? You can say yes or give a different number.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        if answer:
+            return ask("phone", f"Got it, {answer}. Now, I have your phone as {format_phone_usa(phone)}. Is that correct?",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=answer, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        return ask("last", "Sorry, what’s your last name?",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # Phone with 10-digit requirement
+    if stage == "phone":
+        low = answer.lower()
+        if low in ("yes", "yeah", "yep", "correct") and is_valid_phone(phone):
+            return ask("email", f"I have your email as {normalize_email(email)}. Is that correct? You can say yes or give a different email.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        if answer:
+            new_digits = normalize_phone(answer)
+            if is_valid_phone(new_digits):
+                pretty = format_phone_usa(new_digits)
+                return ask("email", f"Thanks. I’ll use {pretty}. Is your email still {normalize_email(email) or 'unknown'}?",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=new_digits, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+            return ask("phone", "I didn’t get a 10 digit phone number. Please say it digit by digit.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        return ask("phone", "What’s the best phone number to reach you? Please say it digit by digit.",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # Email with simple pattern
+    if stage == "email":
+        low = answer.lower()
+        if low in ("yes", "yeah", "yep", "correct") and is_valid_email(email):
+            return ask("device", f"I have your device as {device_model or 'unknown'}. Is that correct? You can say yes or say the model.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        if answer:
+            new_email = normalize_email(answer)
+            if is_valid_email(new_email):
+                return ask("device", f"Thanks. I’ll use {new_email}. Is your device still {device_model or 'unknown'}?",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=new_email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+            return ask("email", "That email didn’t look right. Please say it like user at gmail dot com.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        return ask("email", "What’s the best email to reach you?",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # Device model using curated list and suggestion
+    if stage == "device":
+        low = answer.lower()
+        if low in ("yes", "yeah", "yep", "correct") and device_model:
+            return ask("diag_add", f"I have your issue as {diagnostic or 'not set'}. Would you like to add more detail?",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        if answer:
+            # Exact match first
+            exact = next((m for m in ALL_DEVICE_MODELS if m.lower() == answer.lower()), None)
+            if exact:
+                return ask("diag_add", f"Got it, {exact}. Your issue is {diagnostic or 'not set'}. Add more detail?",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=exact, diagnostic=diagnostic, imei=imei)
+            # Suggest close matches
+            suggestions = suggest_device_models(answer, limit=3)
+            if suggestions:
+                opts = "; ".join(suggestions)
+                return ask("device_choice", f"I heard {answer}. Did you mean {opts}? Please say the exact one.",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+            # No good suggestion, ask again
+            return ask("device", "Could you say the device model again, like iPhone 13 or Galaxy S22 Ultra?",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        return ask("device", "What device model is it?",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    if stage == "device_choice":
+        # Accept any of the suggestions verbatim if they repeat it
+        if answer:
+            match = next((m for m in ALL_DEVICE_MODELS if m.lower() == answer.lower()), None)
+            if match:
+                return ask("diag_add", f"Thanks. Your device is {match}. Would you like to add more detail to the issue?",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=match, diagnostic=diagnostic, imei=imei)
+        return ask("device", "No problem. What device model is it?",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # Append diagnostic if desired
+    if stage == "diag_add":
+        low = answer.lower()
+        if low in ("no", "nah", "nope", "skip"):
+            return ask("imei", "If you have the device IMEI number, you can say it now. Otherwise say skip.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        if answer:
+            new_diag = f"{diagnostic}; {answer}" if diagnostic else answer
+            return ask("imei", "Thanks. If you have the device IMEI number, say it now. Otherwise say skip.",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=new_diag, imei=imei)
+        return ask("diag_add", "You can add any extra details about the issue, or say skip.",
+                   day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
+    # IMEI optional with validation and soft lookup
+    if stage == "imei":
+        low = answer.lower()
+        if low in ("skip", "no", "nah", "nope", ""):
+            # Done, move to Q&A
+            return ask("done", "All set. I can answer general phone repair questions now. What would you like to know?",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+        if answer:
+            raw = re.sub(r"\D", "", answer)
+            if not is_valid_imei(raw):
+                return ask("imei", "That didn’t sound like a valid IMEI. It should be 15 digits. You can try again or say skip.",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+            # Optional checker, non-blocking
+            checked_model = None
+            try:
+                checked = imei_lookup(raw)  # implement or integrate as needed
+                checked_model = (checked.get("brand", "") + " " + checked.get("model", "")).strip()
+            except Exception as e:
+                print(f"[IMEI Lookup ERROR] {e}")
+            if checked_model and device_model and checked_model.lower() != device_model.lower():
+                return ask("device", f"I found {checked_model} for that IMEI, which is different from {device_model}. Would you like to update the device model? Say the correct model, or say keep.",
+                           day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=raw)
+            # Accept and proceed
+            return ask("done", "Thanks. IMEI added. I can answer general phone repair questions now. What would you like to know?",
+                       day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=raw)
+
+    if stage == "done":
+        # Hand off to your AI Q&A flow
+        vr = VoiceResponse()
+        params = urlencode({
+            "day": day, "time_slot": time_slot,
+            "first_name": first_name, "last_name": last_name,
+            "phone": phone, "email": email,
+            "device_model": device_model, "diagnostic": diagnostic, "imei": imei
+        })
+        vr.redirect(f"/voice/inbound/process?{params}")
+        return Response(str(vr), media_type="application/xml")
+
+    # Unknown stage fallback
+    return ask("intro", "Let’s verify your details.",
+               day=day, time_slot=time_slot, first_name=first_name, last_name=last_name, phone=phone, email=email, device_model=device_model, diagnostic=diagnostic, imei=imei)
+
 
 # Health check
 @app.get("/health")
