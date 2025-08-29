@@ -423,43 +423,51 @@ logging.info("[Scheduler] Started with job store at /var/data/scheduled_jobs.sql
 
 from urllib.parse import urlencode
 from twilio.rest import Client
+import os
 
-TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
 BASE_URL = "https://cpr-voice-leads-bot.onrender.com"  # your Render URL
 
 def start_outbound_call(lead: dict):
-    # Split name into first/last if possible
+    # Split name into first/last
     name_parts = lead.get("name", "").strip().split(" ", 1)
     first_name = name_parts[0] if name_parts else ""
     last_name = name_parts[1] if len(name_parts) > 1 else ""
 
-    # Build query params to seed verification flow
+    # Fetch Twilio number at runtime
+    from_number = os.getenv("TWILIO_NUMBER")
+    print(f"[DEBUG] TWILIO_NUMBER in start_outbound_call: {from_number!r}")
+    if not from_number:
+        raise RuntimeError("TWILIO_NUMBER env var is not set or empty — cannot initiate outbound call.")
+
+    # Build query params for initial stage of verification flow
     params = urlencode({
         "stage": "intro",
-        "day": "",  # fill if you have it
-        "time_slot": "",  # fill if you have it
         "first_name": first_name,
         "last_name": last_name,
         "phone": lead.get("phone", ""),
-        "email": lead.get("email", ""),  # include if present in lead
+        "email": lead.get("email", ""),
         "device_model": lead.get("device", ""),
+        "referral": lead.get("source", ""),
         "diagnostic": lead.get("repair_type", ""),
         "imei": lead.get("imei", "")
     })
 
-    verify_url = f"{BASE_URL}/voice/inbound/verify?{params}"
+    # Pick the correct flow URL
+    verify_url = f"{BASE_URL}/voice/outbound/lead/intake?{params}"
 
-    print(f"[Outbound Call] Starting call to {lead.get('phone')} with URL: {verify_url}")
+    print(f"[DEBUG] Placing call to {lead.get('phone')} from {from_number} with URL {verify_url}")
 
     # Twilio REST client
     client = Client(os.getenv("TWILIO_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+
     call = client.calls.create(
-        to=lead["phone"],
-        from_=TWILIO_NUMBER,
+        to=lead.get("phone"),
+        from_=from_number,
         url=verify_url
     )
-    print(f"[Outbound Call] Twilio call SID: {call.sid}")
 
+    print(f"[DEBUG] Outbound call SID: {call.sid}")
+    return call
 
 def should_call_now():
     now = datetime.now(EASTERN)
@@ -696,7 +704,10 @@ async def lead_intake(
     imei: str = "",
     device_model: str = "",
     passcode: str = "",
-    diagnostic: str = ""
+    diagnostic: str = "",
+    # 🔹 extra state so mismatch correction works
+    stage: str = "",
+    reported_model: str = ""
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
@@ -707,102 +718,190 @@ async def lead_intake(
 
     from urllib.parse import urlencode
 
-    def repeat_q(prompt, **kwargs):
+    def repeat_q(prompt, *, timeout=15, speech_timeout="auto", **kwargs):
+        # Always carry context forward
         kwargs.setdefault("day", day)
         kwargs.setdefault("time_slot", time_slot)
+        kwargs.setdefault("stage", stage)
+        kwargs.setdefault("reported_model", reported_model)
         print(f"[Prompting] {prompt} | next_params={kwargs}")
-        params = urlencode(kwargs)  # ✅ encodes spaces, punctuation, etc.
+        params = urlencode(kwargs)
+
         vrq = VoiceResponse()
         vrq.say(prompt)
         g = Gather(
             input="speech",
             action=f"/voice/outbound/lead/intake?{params}",
             method="POST",
-            timeout=15,
-            speech_timeout="auto",
+            timeout=timeout,              # per-prompt overrideable
+            speech_timeout=speech_timeout,
             speech_model="phone_call"
         )
         vrq.append(g)
         return Response(str(vrq), media_type="application/xml")
+
+
     # Step-by-step checks
     if not first_name:
         if not answer:
             return repeat_q("What's your first name?")
-        return repeat_q("Thanks. What's your last name?", first_name=answer)
+        first_name_value = extract_value(answer, "first_name")
+        if not first_name_value:
+            return repeat_q("Sorry, I didn’t catch that. Please say just your first name.")
+        return repeat_q(f"Thanks, I heard your first name is {first_name_value}. What's your last name?",
+                        first_name=first_name_value)
 
     if not last_name:
         if not answer:
             return repeat_q("What's your last name?", first_name=first_name)
-        return repeat_q("What's the best phone number to reach you?", first_name=first_name, last_name=answer)
+        last_name_value = extract_value(answer, "last_name")
+        if not last_name_value:
+            return repeat_q("Sorry, I didn’t catch that. Please say just your last name.",
+                            first_name=first_name)
+        return repeat_q(f"Thanks, I heard your last name is {last_name_value}. What's the best phone number to reach you?",
+                        first_name=first_name, last_name=last_name_value)
 
     if not phone:
         if not answer:
-            return repeat_q("What's the best phone number to reach you?", first_name=first_name, last_name=last_name)
-        return repeat_q("Do you have an alternate phone number? If not, just say no.",
-                        first_name=first_name, last_name=last_name, phone=answer)
+            return repeat_q("What's the best phone number to reach you?",
+                            first_name=first_name, last_name=last_name)
+        phone_value = extract_value(answer, "phone")
+        if not phone_value:
+            return repeat_q("Sorry, please say the phone number one digit at a time, including area code.",
+                            first_name=first_name, last_name=last_name)
+        return repeat_q(f"Thanks, I heard your phone number is {phone_value}. Do you have an alternate phone number? If not, just say no.",
+                        first_name=first_name, last_name=last_name, phone=phone_value)
 
     if not alt_phone:
         if not answer:
             return repeat_q("Do you have an alternate phone number? If not, just say no.",
                             first_name=first_name, last_name=last_name, phone=phone)
-        return repeat_q("What's your email address?",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=answer)
+        lower = answer.lower()
+        if any(p in lower for p in ["no", "nah", "none", "don't have", "do not have", "skip"]):
+            return repeat_q("What's your email address?",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone="")
+        alt_phone_value = extract_value(answer, "alt_phone")
+        if not alt_phone_value:
+            return repeat_q("Sorry, please say the alternate number one digit at a time, or say no if you don't have one.",
+                            first_name=first_name, last_name=last_name, phone=phone)
+        return repeat_q(f"Thanks, I heard your alternate number is {alt_phone_value}. What's your email address?",
+                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone_value)
 
     if not email:
         if not answer:
             return repeat_q("What's your email address?",
                             first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone)
-        return repeat_q("What's your zip code?",
-                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=answer)
+        email_value = extract_value(answer, "email")
+        if not email_value:
+            return repeat_q("Sorry, please say your email like 'name at gmail dot com'.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone)
+        return repeat_q(f"Thanks, I heard your email is {email_value}. What's your zip code?",
+                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email_value)
 
     if not zip_code:
         if not answer:
             return repeat_q("What's your zip code?",
                             first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email)
-        return repeat_q("How did you hear about us?",
+        zip_value = extract_value(answer, "zip_code")
+        if not zip_value:
+            return repeat_q("Sorry, please say just the five-digit zip code.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone, email=email)
+        return repeat_q(f"Thanks. How did you hear about us?",
                         first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=answer)
+                        email=email, zip_code=zip_value)
 
     if not referral:
         if not answer:
             return repeat_q("How did you hear about us?",
                             first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
                             email=email, zip_code=zip_code)
+        referral_value = extract_value(answer, "referral") or answer
         return repeat_q("Can you provide the device IMEI? If not, just say no.",
                         first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=answer)
+                        email=email, zip_code=zip_code, referral=referral_value)
 
+    if stage == "confirm_device_model":
+        lower = answer.lower()
+        if any(p in lower for p in ["yes", "correct", "that's right"]):
+            # Accept API-reported model
+            return repeat_q("Do you have a passcode for the device? If not, say no.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                            email=email, zip_code=zip_code, referral=referral,
+                            imei=imei, device_model=reported_model)
+        else:
+            # Capture corrected model from caller
+            corrected_model = extract_value(answer, "device_model") or answer
+            return repeat_q(f"Thanks, updated to {corrected_model}. Do you have a passcode for the device? If not, say no.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                            email=email, zip_code=zip_code, referral=referral,
+                            imei=imei, device_model=corrected_model)
+    
     if not imei:
         lower = answer.lower()
-        digits_only = re.sub(r"\D", "", answer)
+        digits_only = extract_value(answer, "imei")  # returns 15 digits or ""
 
-        # Handle skip phrases
-        if any(phrase in lower for phrase in ["no", "nah", "none", "don't have", "do not have", "not available", "skip"]):
+        # Skip IMEI if caller doesn't have it
+        if any(phrase in lower for phrase in [
+            "no", "nah", "none", "don't have", "do not have", "not available", "skip"
+        ]):
             return repeat_q("No problem. Do you have a passcode for the device? If not, say no.",
                             first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
                             email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
 
-        # Handle stall phrases
-        if any(phrase in lower for phrase in ["hold on", "hang on", "give me a minute", "one sec", "just a second"]):
+        # Stall phrases — be patient and re-ask with longer timeout
+        if any(phrase in lower for phrase in [
+            "hold on", "hang on", "give me a minute", "one sec", "just a second"
+        ]):
             return repeat_q("Sure, take your time. When you're ready, please read out the fifteen-digit I M E I number clearly, digit by digit.",
                             first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
+                            email=email, zip_code=zip_code, referral=referral, imei="", device_model="",
+                            timeout=12, speech_timeout="auto")
 
-
-        # Validate IMEI
+        # Valid 15-digit IMEI — check with API
         if len(digits_only) == 15:
-            return repeat_q("Got it. Do you have a passcode for the device? If not, say no.",
-                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                            email=email, zip_code=zip_code, referral=referral, imei=digits_only, device_model="")
+            imei_info = imei_lookup(digits_only)  # your helper
+            reported_model = imei_info.get("model", "").strip()
 
-        # Incomplete or unclear
+            if reported_model:
+                if device_model and reported_model.lower() != device_model.lower():
+                    # Mismatch — confirm with customer
+                    return repeat_q(
+                        f"I checked the IMEI and it shows {reported_model}. "
+                        f"You mentioned {device_model}. Is {reported_model} correct?",
+                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                        email=email, zip_code=zip_code, referral=referral,
+                        imei=digits_only, device_model=device_model,
+                        reported_model=reported_model, stage="confirm_device_model"
+                    )
+                else:
+                    spoken = ", ".join(digits_only)
+                    return repeat_q(
+                        f"Got it. I heard {spoken} and it matches {reported_model}. "
+                        "Do you have a passcode for the device? If not, say no.",
+                        first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                        email=email, zip_code=zip_code, referral=referral,
+                        imei=digits_only, device_model=reported_model
+                    )
+            else:
+                # API returned nothing — proceed
+                spoken = ", ".join(digits_only)
+                return repeat_q(
+                    f"Got it. I heard {spoken}. Do you have a passcode for the device? If not, say no.",
+                    first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                    email=email, zip_code=zip_code, referral=referral,
+                    imei=digits_only, device_model=device_model
+                )
+
+        # Incomplete or unclear — give more time and clear instruction
         return repeat_q("I only heard part of the number. Please read your complete fifteen-digit I M E I number, digit by digit.",
                         first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
-
+                        email=email, zip_code=zip_code, referral=referral, imei="", device_model="",
+                        timeout=12, speech_timeout="auto")
     if not passcode:
-        passcode_value = "" if answer.lower() in ["no", "nah", "none"] else answer
-        return repeat_q("Briefly describe the issue with the device.",
+        lower = answer.lower()
+        passcode_value = "" if any(p in lower for p in ["no", "nah", "none", "skip"]) else answer
+        # For privacy, don't read passcode aloud
+        return repeat_q("Thanks. Briefly describe the issue with the device.",
                         first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
                         email=email, zip_code=zip_code, referral=referral,
                         imei=imei, device_model=device_model, passcode=passcode_value)
@@ -835,12 +934,12 @@ async def lead_intake(
         vr_final.say(f"Thanks {first_name}, you're booked for the {day} at {time_slot}. I've saved your ticket.")
         vr_final.say("I can also answer general phone repair questions if you have any.")
         vr_final.redirect("/voice/inbound")
-        
+
         params = urlencode(ticket)
         vr_final.redirect(f"/voice/inbound/verify?{params}")
         return Response(str(vr_final), media_type="application/xml")
 
-        # Failsafe
+    # Failsafe
     return repeat_q("Sorry, I didn’t catch that. Could you repeat?")
 
 # === NEW: General phone repair Q&A after booking ===
