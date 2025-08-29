@@ -13,10 +13,142 @@ from datetime import datetime as dt, timedelta
 import dateparser
 from urllib.parse import quote_plus
 from urllib.parse import urlencode
+from openai import OpenAI
+openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+from urllib.parse import urlencode
+from twilio.rest import Client
+import os
+import os
+import json
+import gspread
 
-import logging
-logging.basicConfig()
-logging.getLogger('apscheduler').setLevel(logging.INFO)
+BASE_URL = "https://cpr-voice-leads-bot.onrender.com"  # your Render URL
+
+# Create a single Twilio client for both voice and SMS
+twilio_client = Client(
+    os.getenv("TWILIO_SID"),
+    os.getenv("TWILIO_AUTH_TOKEN")
+)
+# Default number to fall back on if no phone is in lead_state
+# You can set this to your store’s number, a test handset, or leave as None
+DEFAULT_PHONE_FALLBACK = "+18435550123"
+
+
+def say_human(vr: VoiceResponse, text: str):
+    """
+    Speak text with a human‑like voice everywhere in the app.
+    Change `voice` to any Polly voice you prefer.
+    """
+    say_human(vr, text, voice="Polly.Joanna")
+    return vr
+
+def check_utilities(answer: str, lead_state: dict, current_route: str, stage: str):
+    lower = (answer or "").lower()
+
+    # === Global Goodbye Detection ===
+    if any(bye in lower for bye in [
+        "goodbye", "bye", "bye bye", "ok bye", "okay bye",
+        "thanks", "thank you", "no thanks", "i'm good",
+        "that’s all", "that's all", "see ya", "see you",
+        "take care", "have a good one", "talk to you later",
+        "nothing else", "nope", "nah", "all set", "we're done",
+        "im done", "i am done", "done"
+    ]):
+        vr = VoiceResponse()
+        say_human(vr, "Alright, thanks for calling. Have a great day!")
+        vr.hangup()
+        return Response(str(vr), media_type="application/xml")
+
+    # === Directions → SMS Google Maps link ===
+    if "direction" in lower or "map" in lower:
+        maps_link = (
+    f"https://www.google.com/maps/dir/?api=1"
+    f"&destination={STORE_INFO['address'].replace(' ', '+')}"
+    f"&key={os.getenv('GOOGLE_MAPS_API_KEY')}"
+)
+        to_number = lead_state.get("phone") or DEFAULT_PHONE_FALLBACK
+        try:
+            twilio_client.messages.create(
+                body=f"Here’s the location for {STORE_INFO['name']}: {maps_link}",
+                from_=os.getenv("TWILIO_NUMBER"),
+                to=to_number
+            )
+        except Exception as e:
+            print(f"[SMS ERROR] {e}")
+        return repeat_q("I’ve texted you a Google Maps link to our store. Do you want to book a repair now?",
+                        action_path="/voice/outbound/lead/intake",
+                        stage=stage,
+                        **lead_state)
+
+    if "hour" in lower:
+        return repeat_q(f"Our hours are {STORE_INFO['hours']}. Do you want to book a repair now?",
+                        action_path="/voice/outbound/lead/intake",
+                        stage=stage, **lead_state)
+
+    if "how long" in lower or "turnaround" in lower:
+        return repeat_q("Most repairs take about 1 to 2 hours once we start. Do you want to book a repair now?",
+                        action_path="/voice/outbound/lead/intake",
+                        stage=stage, **lead_state)
+
+    if "address" in lower or "location" in lower or "where" in lower:
+        return repeat_q(f"We're at {STORE_INFO['address']}. Would you like me to text you directions and book you in?",
+                        action_path="/voice/outbound/lead/intake",
+                        stage=stage, **lead_state)
+
+    if "phone" in lower and "number" in lower:
+        return repeat_q(f"Our phone number is {STORE_INFO['phone']}. Shall we start a booking?",
+                        action_path="/voice/outbound/lead/intake",
+                        stage=stage, **lead_state)
+
+    # === Price lookup ===
+    if "price" in lower or "quote" in lower:
+        spoken = norm_text(lower)
+        match = lookup_price(spoken)
+        if match:
+            return repeat_q(f"The current price for {match['Device']} {match['RepairType']} is ${match['Price']}. Would you like to book that?",
+                            action_path="/voice/outbound/lead/intake",
+                            stage=stage, **lead_state)
+        else:
+            return repeat_q("Could you tell me the exact device model and repair type?",
+                            action_path="/voice/outbound/lead/intake",
+                            stage="device_model", **lead_state)
+
+    # === Inventory check ===
+    if "in stock" in lower or "have" in lower or "availability" in lower:
+        try:
+            import gspread, json, os
+            creds_json = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
+            if not creds_json:
+                print("[WARN] No Google Sheets creds in env var GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
+                return repeat_q("I couldn't access our inventory right now. Would you like me to still book you in?",
+                                action_path="/voice/outbound/lead/intake",
+                                stage=stage, **lead_state)
+
+            creds = gspread.service_account_from_dict(json.loads(creds_json))
+            sheet = creds.open_by_key(os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")).sheet1
+            rows = sheet.get_all_records()
+
+            spoken_norm = lower
+            matches = [row for row in rows
+                       if row.get("Device", "").lower() in spoken_norm
+                       and str(row.get("InStock", "")).strip() != "0"]
+
+            if matches:
+                parts_list = ", ".join([m['Device'] for m in matches])
+                return repeat_q(f"Yes, we have these in stock: {parts_list}. Do you want to book a repair now?",
+                                action_path="/voice/outbound/lead/intake",
+                                stage=stage, **lead_state)
+            else:
+                return repeat_q("I couldn't find that in our current stock list. Would you like me to still book you in?",
+                                action_path="/voice/outbound/lead/intake",
+                                stage=stage, **lead_state)
+        except Exception as e:
+            print(f"[Inventory Check Error] {e}")
+            return repeat_q("I couldn't check our stock just now. Should I still book you in?",
+                            action_path="/voice/outbound/lead/intake",
+                            stage=stage, **lead_state)
+
+    return None  # No match, continue progression
 
 def repeat_q(prompt, day="", time_slot="", **kwargs):
     # Preserve booking day/time slot unless overridden
@@ -294,6 +426,56 @@ async def proceed_to_quote_and_confirm(*, action_path="/voice/outbound/lead/inta
                         action_path=action_path, **lead_state)
 
 
+def handle_yes(answer: str, lead_state: dict, stage: str, current_route: str):
+    """
+    Universal handler for 'yes' responses during confirmation stages.
+    Saves ticket, plays human-like confirmation, and can redirect to post-booking.
+    """
+    if wants_yes(answer):
+        try:
+            save_mock_ticket(lead_state)
+            print("[Ticket Saved] to Google Sheets:", lead_state)
+        except Exception as e:
+            print(f"[ERROR saving ticket] {e}")
+
+        vr_final = VoiceResponse()
+        say_human(vr_final,
+                  f"Thanks {lead_state.get('first_name','')}, you're booked for "
+                  f"{lead_state.get('day','')} at {lead_state.get('time_slot','')}. "
+                  "I've saved your ticket.")
+        say_human(vr_final,
+                  "I can also answer general phone repair questions if you have any.")
+        params = urlencode(lead_state)
+        vr_final.redirect(f"/voice/inbound/verify?{params}")
+        return Response(str(vr_final), media_type="application/xml")
+    return None
+
+def check_inventory(spoken: str):
+    """
+    Placeholder inventory check against Google Sheets SKUs.
+    Replace with live gspread/RepairQ API when ready.
+    """
+    try:
+        # Example with gspread (requires GOOGLE_SERVICE_ACCOUNT_JSON & GOOGLE_SHEET_ID in env)
+        import gspread, json, os
+        creds_json = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON")
+        if not creds_json:
+            print("[WARN] No Google Sheets creds set in env")
+            return None
+
+        creds = gspread.service_account_from_dict(json.loads(creds_json))
+        sheet = creds.open_by_key(os.getenv("GOOGLE_SHEET_ID")).sheet1
+        rows = sheet.get_all_records()
+
+        matches = []
+        spoken_norm = spoken.lower()
+        for row in rows:
+            if row.get("Device", "").lower() in spoken_norm and str(row.get("InStock", "")).strip() != "0":
+                matches.append(row)
+        return matches or None
+    except Exception as e:
+        print(f"[Inventory Check Error] {e}")
+        return None
 
 # Flattened list for quick search
 ALL_DEVICE_MODELS = [m for brand in DEVICE_MODELS.values() for m in brand]
@@ -301,7 +483,7 @@ ALL_DEVICE_MODELS = [m for brand in DEVICE_MODELS.values() for m in brand]
 app = FastAPI()
 
 def say_and_listen(vr: VoiceResponse, text: str, action="/voice/inbound/process"):
-    vr.say(text)
+    say_human(vr, text)
     g = Gather(
         input="speech",
         action=action,
@@ -507,86 +689,65 @@ async def voice_process(req: Request):
     lower = user_input.lower()
     vr = VoiceResponse()
 
-    # Quick fixed intents
-    if is_directions(lower):
-        return Response(str(say_and_listen(vr, "Sure. What's your starting address or location?")), media_type="application/xml")
-    if is_hours(lower):
-        return Response(str(say_and_listen(vr, f"Our hours are {STORE_INFO['hours']}. Anything else I can help with?")), media_type="application/xml")
-    if is_location(lower):
-        return Response(str(say_and_listen(vr, f"We're at {STORE_INFO['address']}. Do you need directions?")), media_type="application/xml")
-    if is_phone(lower):
-        return Response(str(say_and_listen(vr, f"Our phone number is {STORE_INFO['phone']}. What else can I help with?")), media_type="application/xml")
-    if is_landmarks(lower):
-        return Response(str(say_and_listen(vr, "We’re near Goodwill and Lowe’s, in the strip with Chipotle, McAlister’s, Sport Clips, and UPS.")), media_type="application/xml")
+    # Pull any state passed in
+    lead_state = build_lead_state(**{f: req.query_params.get(f, "") for f in REQUIRED_FIELDS})
+    stage = req.query_params.get("stage", "")
 
+    # 1) Utilities & goodbye first
+    util = check_utilities(user_input, lead_state, current_route="/voice/inbound/process", stage=stage)
+    if util:
+        return util
+
+    # 2) Global YES handling
+    yes_response = handle_yes(user_input, lead_state, stage, current_route="/voice/inbound/process")
+    if yes_response:
+        return yes_response
+
+    # 3) Price match branch
     repair_keywords = [
         "repair","screen","battery","cracked","broken","device","phone","tablet",
         "hours","address","location","directions","price","quote","appointment"
     ]
-    if not any(t in lower for t in repair_keywords):
-        return Response(
-            str(say_and_listen(vr, "I can help with repairs, pricing, or booking. Is your question about a device or repair?")),
-            media_type="application/xml"
-        )
-
-    from openai import OpenAI
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-    try:
-        # --- Price-related safe match ---
-        if any(t in lower for t in repair_keywords):
-            detected = None
-            spoken = norm_text(lower)
-
-            for row in lookup_price_rows():
-                dev_norm = norm_text(row.get("Device", ""))
-                rep_norm = norm_text(row.get("RepairType", ""))
-                if not dev_norm or not rep_norm:
-                    continue
-
-                # Drop brand word for tail matching (still requires full tail match)
-                parts = dev_norm.split()
-                tail = " ".join(parts[1:]) if parts and parts[0] in [
-                    "samsung","galaxy","apple","iphone","google","pixel"
-                ] else dev_norm
-
-                if rep_norm in spoken and (dev_norm in spoken or tail in spoken):
-                    detected = row
-                    break
-
-            if detected:
-                vr.say(f"The current price for {detected['Device']} {detected['RepairType']} is ${detected['Price']}.")
-                return Response(str(say_and_listen(vr, "Anything else I can help with?")), media_type="application/xml")
-            else:
-                # No safe match → re-ask
+    if any(t in lower for t in repair_keywords):
+        spoken = norm_text(lower)
+        for row in lookup_price_rows():
+            dev_norm = norm_text(row.get("Device", ""))
+            rep_norm = norm_text(row.get("RepairType", ""))
+            if not dev_norm or not rep_norm:
+                continue
+            parts = dev_norm.split()
+            tail = " ".join(parts[1:]) if parts and parts[0] in [
+                "samsung","galaxy","apple","iphone","google","pixel"
+            ] else dev_norm
+            if rep_norm in spoken and (dev_norm in spoken or tail in spoken):
+                say_human(vr, f"The current price for {row['Device']} {row['RepairType']} is ${row['Price']}.")
                 return Response(
-                    str(say_and_listen(
-                        vr,
-                        "Could you tell me the exact device model, like 'Samsung Galaxy S23 Ultra' or 'iPhone 13 Pro'?",
-                        action="/voice/inbound/process"
-                    )),
+                    str(say_and_listen(vr, "Anything else I can help with?")),
                     media_type="application/xml"
                 )
-
-        # --- Non-price branch → LLM fallback ---
-        system_prompt = f"""
-        You are the receptionist for {STORE_INFO['name']} in {STORE_INFO['city']}.
-        Stay strictly on store/services/repairs. Keep answers to 1–3 sentences.
-        If asked for a price and you don't know it, say you'll check with a tech.
-        """
-        msgs = [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_input}
-        ]
-        out = client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
-        text = out.choices[0].message.content.strip()
-        return Response(str(say_and_listen(vr, text)), media_type="application/xml")
-
-    except Exception:
+        # No match → re‑ask
         return Response(
-            str(say_and_listen(vr, "Sorry, I’m having trouble right now. Could you try again shortly?")),
+            str(say_and_listen(
+                vr,
+                "Could you tell me the exact device model, like 'Samsung Galaxy S23 Ultra' or 'iPhone 13 Pro'?",
+                action="/voice/inbound/process"
+            )),
             media_type="application/xml"
         )
+
+    # 4) Fallback to LLM
+    system_prompt = f"""
+    You are the receptionist for {STORE_INFO['name']} in {STORE_INFO['city']}.
+    Stay strictly on store/services/repairs. Keep answers to 1–3 sentences.
+    If asked for a price and you don't know it, say you'll check with a tech.
+    """
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_input}
+    ]
+    out = openai_client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
+    text = out.choices[0].message.content.strip()
+    return Response(str(say_and_listen(vr, text)), media_type="application/xml")
 
 from datetime import datetime, timedelta
 import pytz
@@ -612,11 +773,6 @@ scheduler = BackgroundScheduler(jobstores=jobstores, timezone=EASTERN)
 scheduler.start()
 logging.info("[Scheduler] Started with job store at /var/data/scheduled_jobs.sqlite")
 
-from urllib.parse import urlencode
-from twilio.rest import Client
-import os
-
-BASE_URL = "https://cpr-voice-leads-bot.onrender.com"  # your Render URL
 
 def start_outbound_call(lead: dict):
     # Split name into first/last
@@ -692,6 +848,66 @@ def schedule_lead_call(lead):
             misfire_grace_time=600  # 10‑minute grace if app is down briefly
         )
 
+@app.post("/voice/inbound/start")
+async def inbound_start(req: Request):
+    """True entry point for brand‑new inbound calls."""
+    form = await req.form()
+    answer = (form.get("SpeechResult") or "").strip()
+
+    # Brand‑new empty state
+    lead_state = build_lead_state(**{f: "" for f in REQUIRED_FIELDS})
+    stage = ""
+
+    # 1) First turn: play branded greeting
+    if not answer:
+        vr = VoiceResponse()
+        g = Gather(
+            input="speech",
+            action="/voice/inbound/start",
+            method="POST",
+            timeout=25,
+            speech_timeout="auto",
+            speech_model="phone_call"
+        )
+        say_human(
+            g,
+            "Hi, thank you for calling CPR Cell Phone Repair. "
+            "How may I help you today? You can ask about our services, get directions, "
+            "check a price, or start a booking."
+        )
+        vr.append(g)
+        return Response(str(vr), media_type="application/xml")
+
+    # 2) Utilities & goodbye detection first
+    util = check_utilities(answer, lead_state, current_route="/voice/inbound/start", stage=stage)
+    if util:
+        return util
+
+    # 3) Global YES handling
+    yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/inbound/start")
+    if yes_response:
+        return yes_response
+
+    lower = answer.lower()
+
+    # 4) Booking intent detection
+    booking_keywords = [
+        "book", "appointment", "repair", "fix", "replace",
+        "screen", "battery", "yes", "start", "schedule"
+    ]
+    if any(word in lower for word in booking_keywords):
+        return repeat_q(
+            "Great, let's get some details for your booking.",
+            action_path="/voice/outbound/lead/intake",
+            stage="",
+            **lead_state
+        )
+
+    # 5) Everything else → general inbound Q&A
+    vr = VoiceResponse()
+    vr.redirect("/voice/inbound")
+    return Response(str(vr), media_type="application/xml")
+
 @app.post("/webhooks/repairq/lead")
 async def repairq_lead(req: Request):
     # ✅ Safeguard: check Twilio number is set before scheduling
@@ -714,24 +930,72 @@ async def repairq_lead(req: Request):
 @app.post("/voice/outbound/lead")
 @app.get("/voice/outbound/lead")
 async def voice_outbound_lead(req: Request, **state):
-    """Entry point for outbound calls — hand straight to intake AI engine."""
-    # state here comes from query params (RepairQ lead info)
+    """Entry point for outbound lead calls with tailored AI greeting."""
+    lead_state = build_lead_state(**{f: state.get(f, "") for f in REQUIRED_FIELDS})
+    stage = state.get("stage", "")
+
+    # 1) Utilities & goodbye check first
+    util = check_utilities("", lead_state, current_route="/voice/outbound/lead", stage=stage)
+    if util:
+        return util
+
+    # 2) Global YES handling
+    yes_response = handle_yes("", lead_state, stage, current_route="/voice/outbound/lead")
+    if yes_response:
+        return yes_response
+
+    # 3) First turn: personalised outbound greeting if no stage set
+    if not stage:
+        device_info = state.get("device", "").strip()
+        repair_type = state.get("repair_type", "").strip()
+
+        if device_info and repair_type:
+            context_line = f"about your recent {device_info} {repair_type} inquiry"
+        elif device_info:
+            context_line = f"about your recent {device_info} inquiry"
+        else:
+            context_line = "about your recent repair inquiry"
+
+        return repeat_q(
+            f"Hi, this is CPR Cell Phone Repair calling {context_line}. "
+            f"I just need to get a few quick details to help with your booking.",
+            action_path="/voice/outbound/lead/intake",
+            stage="",
+            **lead_state
+        )
+
+    # 4) Already mid‑flow? Resume intake
     return repeat_q(
-        "Hi, let's get a few quick details to help with your booking.",
+        "Let's continue with your booking.",
         action_path="/voice/outbound/lead/intake",
-        stage=state.get("stage", ""), 
-        **{f: state.get(f, "") for f in REQUIRED_FIELDS}
+        stage=stage,
+        **lead_state
     )
+
 @app.post("/voice/outbound/lead/process")
 async def outbound_lead_process(req: Request, **state):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
 
+    lead_state = build_lead_state(**{f: state.get(f, "") for f in REQUIRED_FIELDS})
+    stage = state.get("stage", "")
+
+    # 1) Utilities first
+    util = check_utilities(answer, lead_state, current_route="/voice/outbound/lead/process", stage=stage)
+    if util:
+        return util
+
+    # 2) Global YES handling
+    yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/outbound/lead/process")
+    if yes_response:
+        return yes_response
+
+    # 3) Field progression
     result = handle_field_progression(
         answer=answer,
-        stage=state.get("stage", ""),
+        stage=stage,
         reported_model=state.get("reported_model", ""),
-        **{f: state.get(f, "") for f in REQUIRED_FIELDS}
+        **lead_state
     )
     if result and result.get("prompt"):
         return repeat_q(
@@ -743,11 +1007,13 @@ async def outbound_lead_process(req: Request, **state):
             speech_timeout="auto",
             **result["lead_state"]
         )
-    return repeat_q("Sorry, I didn’t catch that. Could you repeat?",
-                    action_path="/voice/outbound/lead/process",
-                    **state)
 
-
+    # 4) Fallback
+    return repeat_q(
+        "Sorry, I didn’t catch that. Could you repeat?",
+        action_path="/voice/outbound/lead/process",
+        **state
+    )
 @app.post("/voice/outbound/lead/intake")
 async def lead_intake(
     req: Request,
@@ -770,107 +1036,37 @@ async def lead_intake(
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
 
-    # 1) Final "all fields complete" confirmation
-    if stage == "confirm_summary":
-        if wants_yes(answer):
-            # All fields are done, so now you can save to RepairQ or Google Sheets
-            ticket = build_lead_state(
-                day=day, time_slot=time_slot,
-                first_name=first_name, last_name=last_name,
-                phone=phone, alt_phone=alt_phone, email=email,
-                zip_code=zip_code, referral=referral,
-                imei=imei, device_model=device_model,
-                passcode=passcode, diagnostic=diagnostic
-            )
-            try:
-                save_mock_ticket(ticket)
-            except Exception as e:
-                print(f"[ERROR saving ticket] {e}")
+    # Build lead_state once and reuse
+    lead_state = build_lead_state(
+        day=day, time_slot=time_slot,
+        first_name=first_name, last_name=last_name,
+        phone=phone, alt_phone=alt_phone, email=email,
+        zip_code=zip_code, referral=referral,
+        imei=imei, device_model=device_model,
+        passcode=passcode, diagnostic=diagnostic
+    )
 
-            vr_final = VoiceResponse()
-            vr_final.say(f"Thanks {first_name}, you're booked for the {day} at {time_slot}. I've saved your ticket.")
-            vr_final.say("I can also answer general phone repair questions if you have any.")
-            # Optional: redirect into inbound Q&A
-            vr_final.redirect("/voice/inbound")
-            params = urlencode(ticket)
-            vr_final.redirect(f"/voice/inbound/verify?{params}")
-            return Response(str(vr_final), media_type="application/xml")
+    # 1) Utilities first
+    util = check_utilities(answer, lead_state, current_route="/voice/outbound/lead/intake", stage=stage)
+    if util:
+        return util
 
-        if wants_no(answer):
-            return repeat_q(
-                "Which field do you want to change? For example: day, time, email, or device model.",
-                action_path="/voice/outbound/lead/intake",
-                stage="correction_target",
-                **build_lead_state(
-                    day=day, time_slot=time_slot,
-                    first_name=first_name, last_name=last_name,
-                    phone=phone, alt_phone=alt_phone, email=email,
-                    zip_code=zip_code, referral=referral,
-                    imei=imei, device_model=device_model,
-                    passcode=passcode, diagnostic=diagnostic
-                )
-            )
+    # 2) Global YES handling for confirm_summary
+    yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/outbound/lead/intake")
+    if yes_response:
+        return yes_response
 
-        # Neither a clear yes nor no → re-read summary
+    # 3) NO handling
+    if stage == "confirm_summary" and wants_no(answer):
         return repeat_q(
-            read_back_summary(build_lead_state(
-                day=day, time_slot=time_slot,
-                first_name=first_name, last_name=last_name,
-                phone=phone, alt_phone=alt_phone, email=email,
-                zip_code=zip_code, referral=referral,
-                imei=imei, device_model=device_model,
-                passcode=passcode, diagnostic=diagnostic
-            )),
+            "Which field do you want to change? For example: day, time, email, or device model.",
             action_path="/voice/outbound/lead/intake",
-            stage="confirm_summary",
-            **build_lead_state(
-                day=day, time_slot=time_slot,
-                first_name=first_name, last_name=last_name,
-                phone=phone, alt_phone=alt_phone, email=email,
-                zip_code=zip_code, referral=referral,
-                imei=imei, device_model=device_model,
-                passcode=passcode, diagnostic=diagnostic
-            )
+            stage="correction_target",
+            **lead_state
         )
 
-    # 1) Final "all fields complete" confirmation
+    # 4) Unclear answer at confirm_summary → re‑read summary
     if stage == "confirm_summary":
-        lead_state = build_lead_state(
-            day=day, time_slot=time_slot,
-            first_name=first_name, last_name=last_name,
-            phone=phone, alt_phone=alt_phone, email=email,
-            zip_code=zip_code, referral=referral,
-            imei=imei, device_model=device_model,
-            passcode=passcode, diagnostic=diagnostic
-        )
-
-        if wants_yes(answer):
-            # Save the completed ticket to RepairQ or Google Sheets
-            try:
-                save_mock_ticket(lead_state)
-            except Exception as e:
-                print(f"[ERROR saving ticket] {e}")
-
-            # Thank caller & transition into post‑booking Q&A
-            vr_final = VoiceResponse()
-            vr_final.say(
-                f"Thanks {lead_state['first_name']}, you're booked for the "
-                f"{lead_state['day']} at {lead_state['time_slot']}. I've saved your ticket."
-            )
-            vr_final.say("I can also answer general phone repair questions if you have any.")
-            params = urlencode(lead_state)
-            vr_final.redirect(f"/voice/inbound/verify?{params}")
-            return Response(str(vr_final), media_type="application/xml")
-
-        if wants_no(answer):
-            return repeat_q(
-                "Which field do you want to change? For example: day, time, email, or device model.",
-                action_path="/voice/outbound/lead/intake",
-                stage="correction_target",
-                **lead_state
-            )
-
-        # Unclear answer → re‑read the summary
         return repeat_q(
             read_back_summary(lead_state),
             action_path="/voice/outbound/lead/intake",
@@ -878,7 +1074,7 @@ async def lead_intake(
             **lead_state
         )
 
-    # 2) Field‑level correction target
+    # 5) Field‑level correction target
     if stage == "correction_target":
         field_map = {
             "day": "day", "date": "day",
@@ -902,16 +1098,6 @@ async def lead_intake(
                 if k in key:
                     target = v
                     break
-
-        lead_state = build_lead_state(
-            day=day, time_slot=time_slot,
-            first_name=first_name, last_name=last_name,
-            phone=phone, alt_phone=alt_phone, email=email,
-            zip_code=zip_code, referral=referral,
-            imei=imei, device_model=device_model,
-            passcode=passcode, diagnostic=diagnostic
-        )
-
         if not target:
             return repeat_q(
                 "Sorry, which field should I change? For example say: day, time, email, phone, or device model.",
@@ -920,7 +1106,6 @@ async def lead_intake(
                 **lead_state
             )
 
-        # Ask for the new value
         return repeat_q(
             f"Okay, what's the correct {target.replace('_', ' ')}?",
             action_path="/voice/outbound/lead/intake",
@@ -928,17 +1113,12 @@ async def lead_intake(
             **lead_state
         )
 
-    # 3) Core progression — ask next missing field, or reach summary if all done
+    # 6) Core progression
     result = handle_field_progression(
         answer=answer,
         stage=stage,
         reported_model=reported_model,
-        day=day, time_slot=time_slot,
-        first_name=first_name, last_name=last_name,
-        phone=phone, alt_phone=alt_phone, email=email,
-        zip_code=zip_code, referral=referral,
-        imei=imei, device_model=device_model,
-        passcode=passcode, diagnostic=diagnostic
+        **lead_state
     )
     if result and result.get("prompt") and result.get("lead_state"):
         return repeat_q(
@@ -950,50 +1130,70 @@ async def lead_intake(
             speech_timeout=result.get("speech_timeout", "auto"),
             **result["lead_state"]
         )
-    
-# 4) Failsafe — only runs if we somehow fall through all above
-    return repeat_q("Sorry, I didn’t catch that. Could you repeat?",
-                    action_path="/voice/outbound/lead/intake")
 
-# === NEW: General phone repair Q&A after booking ===
+    # 7) Failsafe
+    return repeat_q(
+        "Sorry, I didn’t catch that. Could you repeat?",
+        action_path="/voice/outbound/lead/intake",
+        **lead_state
+    )
+
 @app.post("/voice/inbound")
-async def voice_inbound(req: Request):
+async def voice_inbound(req: Request, **state):
     """Entry point after booking to handle general phone repair questions."""
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
     print(f"[Inbound Q&A] answer={answer}")
 
+    # Build current state so we can preserve context if they branch to intake
+    lead_state = build_lead_state(**{f: state.get(f, "") for f in REQUIRED_FIELDS})
+    stage = state.get("stage", "")
+
+    # 1) Utilities first — directions, hours, address, phone, price, etc.
+    util = check_utilities(answer, lead_state, current_route="/voice/inbound", stage=stage)
+    if util:
+        return util
+
+    # 2) Global YES handling
+    yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/inbound")
+    if yes_response:
+        return yes_response
+
     vr = VoiceResponse()
 
-    # First turn – greet and invite a question
+    # 3) First turn – greet and invite a question
     if not answer:
         g = Gather(
             input="speech",
             action="/voice/inbound",
             method="POST",
-            timeout=15,
+            timeout=25,
             speech_timeout="auto",
             speech_model="phone_call"
         )
-        g.say("What would you like to know? You can ask about our hours, our location, how long repairs take, or any other phone repair question.")
+        say_human(
+            g,
+            "What would you like to know? You can ask about our hours, our location, "
+            "how long repairs take, a price, or start a booking."
+        )
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
     lower = answer.lower()
 
-    # Quick fixed answers for common topics
+    # 4) Legacy quick fixed answers
     if "hour" in lower:
-        vr.say(f"Our hours are {STORE_INFO['hours']}.")
+        say_human(vr, f"Our hours are {STORE_INFO['hours']}.")
     elif "location" in lower or "address" in lower or "where" in lower:
-        vr.say(f"We're at {STORE_INFO['address']}.")
+        say_human(vr, f"We're at {STORE_INFO['address']}.")
     elif "how long" in lower or "long" in lower or "turnaround" in lower:
-        vr.say("We usually quote repairs at 1 to 2 hours once we begin work.")
+        say_human(vr, "We usually quote repairs at 1 to 2 hours once we begin work.")
     else:
-        # Hand off to your AI repair Q&A flow (already implemented in /voice/inbound/process)
+        # 5) Hand off to your AI repair Q&A flow
         vr.redirect("/voice/inbound/process")
         return Response(str(vr), media_type="application/xml")
 
-    # After answering, loop back so they can ask more
+    # 6) After answering, loop back so they can ask more
     vr.redirect("/voice/inbound")
     return Response(str(vr), media_type="application/xml")
 
@@ -1021,7 +1221,17 @@ async def inbound_verify(
         passcode=passcode, diagnostic=diagnostic
     )
 
-    # Handle correction stage (user wants to change a specific field)
+    # 1) Utilities first
+    util = check_utilities(answer, lead_state, current_route="/voice/inbound/verify", stage=stage)
+    if util:
+        return util
+
+    # 2) Global YES handling
+    yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/inbound/verify")
+    if yes_response:
+        return yes_response
+
+    # 3) Correction stage
     if stage == "correction_target":
         field_map = {
             "day": "day", "date": "day",
@@ -1061,7 +1271,7 @@ async def inbound_verify(
             **lead_state
         )
 
-    # First time in? Read back summary
+    # 4) First time in? Read back summary
     if not stage:
         return repeat_q(
             read_back_summary(lead_state),
@@ -1071,26 +1281,18 @@ async def inbound_verify(
             **lead_state
         )
 
-    # Summary confirmation
+    # 5) NO at confirm_summary
+    if stage == "confirm_summary" and wants_no(answer):
+        return repeat_q(
+            "Which field would you like to change?",
+            action_path="/voice/inbound/verify",
+            stage="correction_target",
+            timeout=30, speech_timeout="auto",
+            **lead_state
+        )
+
+    # 6) Unclear at confirm_summary → re‑read
     if stage == "confirm_summary":
-        if wants_yes(answer):
-            try:
-                save_mock_ticket(lead_state)  # Google Sheets / RepairQ push
-            except Exception as e:
-                print(f"[ERROR saving ticket] {e}")
-            vr_final = VoiceResponse()
-            vr_final.say("Thanks, your booking is confirmed.")
-            vr_final.say("Would you like to ask any other questions?")
-            vr_final.redirect("/voice/inbound")
-            return Response(str(vr_final), media_type="application/xml")
-        if wants_no(answer):
-            return repeat_q(
-                "Which field would you like to change?",
-                action_path="/voice/inbound/verify",
-                stage="correction_target",
-                timeout=30, speech_timeout="auto",
-                **lead_state
-            )
         return repeat_q(
             read_back_summary(lead_state),
             action_path="/voice/inbound/verify",
@@ -1099,7 +1301,7 @@ async def inbound_verify(
             **lead_state
         )
 
-    # Otherwise, let the AI progression handle any remaining/missing fields
+    # 7) Progression for remaining fields
     result = handle_field_progression(
         answer=answer,
         stage=stage,
@@ -1123,7 +1325,7 @@ async def inbound_verify(
             **result["lead_state"]
         )
 
-    # Failsafe
+    # 8) Failsafe
     return repeat_q(
         "Sorry, I didn’t catch that. Could you repeat?",
         action_path="/voice/inbound/verify",
