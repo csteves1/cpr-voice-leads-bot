@@ -14,6 +14,10 @@ import dateparser
 from urllib.parse import quote_plus
 from urllib.parse import urlencode
 
+import logging
+logging.basicConfig()
+logging.getLogger('apscheduler').setLevel(logging.INFO)
+
 def repeat_q(prompt, day="", time_slot="", **kwargs):
     # Preserve booking day/time slot unless overridden
     kwargs.setdefault("day", day)
@@ -191,17 +195,35 @@ def suggest_device_models(user_text: str, limit: int = 5):
     scored.sort(key=lambda x: (-x[0], x[1]))
     return [m for _, m in scored[:limit]]
 
+import os
+import requests
+
 def imei_lookup(imei: str) -> dict:
     """
-    Placeholder IMEI lookup.
-    Replace this with a real API call to an IMEI checking service.
-    Should return a dict like:
-        {"brand": "Apple", "model": "iPhone 13", "status": "Clean"}
+    Look up IMEI details using IMEI.info API.
+    Returns a dict with at least 'brand' and 'model' if found.
     """
-    # TODO: integrate with a real IMEI API
-    # For now, just return empty so the flow can continue
-    return {}
+    api_key = os.getenv("IMEI_INFO_API_KEY")
+    if not api_key:
+        raise RuntimeError("IMEI_INFO_API_KEY not set in environment")
 
+    url = "https://api.imei.info/v1/imei"  # Example endpoint — check docs for exact path
+    params = {"apikey": api_key, "imei": imei}
+
+    try:
+        resp = requests.get(url, params=params, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        print(f"[IMEI Lookup ERROR] {e}")
+        return {}
+
+    # Adjust parsing based on actual API response structure
+    return {
+        "brand": data.get("brand", ""),
+        "model": data.get("model", ""),
+        "raw": data
+    }
 # --- Secure Google Sheets helpers ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -343,18 +365,28 @@ async def voice_process(req: Request):
 
 from datetime import datetime, timedelta
 import pytz
+import re
+import logging
 from apscheduler.schedulers.background import BackgroundScheduler
 from apscheduler.jobstores.sqlalchemy import SQLAlchemyJobStore
 
 EASTERN = pytz.timezone("US/Eastern")
 
-# Persistent job store (SQLite file in your project dir)
+# Persistent job store (SQLite file on your Render disk at /var/data)
 jobstores = {
-    'default': SQLAlchemyJobStore(url='sqlite:///scheduled_jobs.sqlite')
+    # NOTE: Four slashes after sqlite: for absolute path
+    'default': SQLAlchemyJobStore(url='sqlite:////var/data/scheduled_jobs.sqlite')
 }
 
+# Set up basic logging so you can see job activity in Render logs
+logging.basicConfig(level=logging.INFO)
+logging.getLogger("apscheduler").setLevel(logging.INFO)
+
+# Create and start the scheduler when the app starts
 scheduler = BackgroundScheduler(jobstores=jobstores, timezone=EASTERN)
 scheduler.start()
+logging.info("[Scheduler] Started with job store at /var/data/scheduled_jobs.sqlite")
+
 
 def should_call_now():
     now = datetime.now(EASTERN)
@@ -362,27 +394,30 @@ def should_call_now():
     end = now.replace(hour=18, minute=0, second=0, microsecond=0)
     return start <= now <= end
 
+
 def schedule_lead_call(lead):
     now = datetime.now(EASTERN)
     if should_call_now():
         print("[Lead Call] Within business hours — calling immediately.")
         start_outbound_call(lead)
     else:
-        # Figure next 10 AM Eastern
-        if now.hour >= 18:
-            next_call_time = (now + timedelta(days=1)).replace(hour=10, minute=0, second=0, microsecond=0)
-        else:  # before 10 AM
-            next_call_time = now.replace(hour=10, minute=0, second=0, microsecond=0)
-
+        # For quick‑fire test: run 2 minutes from now
+        next_call_time = now + timedelta(minutes=2)
+        
         print(f"[Lead Call] Outside business hours — scheduling for {next_call_time.isoformat()}")
-        job_id = f"lead_call_{lead.get('phone','')}_{int(next_call_time.timestamp())}"
+
+        # Make a safe job id so duplicates get replaced if same lead/time
+        safe_phone = re.sub(r"\D", "", lead.get("phone", ""))
+        job_id = f"lead_call_{safe_phone}_{int(next_call_time.timestamp())}"
+
         scheduler.add_job(
             start_outbound_call,
             'date',
             run_date=next_call_time,
             args=[lead],
             id=job_id,
-            replace_existing=True
+            replace_existing=True,
+            misfire_grace_time=600  # 10‑minute grace if app is down briefly
         )
 
 @app.post("/webhooks/repairq/lead")
