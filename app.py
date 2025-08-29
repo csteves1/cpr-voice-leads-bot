@@ -34,12 +34,12 @@ twilio_client = Client(
 DEFAULT_PHONE_FALLBACK = "+18435550123"
 
 
-def say_human(vr: VoiceResponse, text: str):
+def say_human(vr: VoiceResponse, text: str, voice: str = "Polly.Joanna"):
     """
-    Speak text with a human‑like voice everywhere in the app.
-    Change `voice` to any Polly voice you prefer.
+    Speak text with a chosen human‑like voice everywhere in the app.
+    Defaults to Polly.Joanna if no voice passed.
     """
-    say_human(vr, text, voice="Polly.Joanna")
+    vr.say(text, voice=voice)
     return vr
 
 def check_utilities(answer: str, lead_state: dict, current_route: str, stage: str):
