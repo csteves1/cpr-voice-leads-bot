@@ -224,6 +224,40 @@ def imei_lookup(imei: str) -> dict:
         "model": data.get("model", ""),
         "raw": data
     }
+import re
+
+def extract_value(answer: str, field: str) -> str:
+    """Extracts the relevant value from a natural sentence based on field type."""
+    answer = answer.strip()
+
+    # If it's a name, just grab the last word (e.g., "my name is Chris" → "Chris")
+    if field in ["first_name", "last_name"]:
+        words = answer.split()
+        return words[-1] if words else ""
+
+    # If it's an email, use regex
+    if field == "email":
+        match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", answer)
+        return match.group(0) if match else ""
+
+    # If it's a phone number, grab digits
+    if field in ["phone", "alt_phone"]:
+        digits = re.sub(r"\D", "", answer)
+        return digits if len(digits) >= 7 else ""
+
+    # If it's a zip code, grab 5-digit number
+    if field == "zip_code":
+        match = re.search(r"\b\d{5}\b", answer)
+        return match.group(0) if match else ""
+
+    # If it's IMEI, grab 15-digit number
+    if field == "imei":
+        digits = re.sub(r"\D", "", answer)
+        return digits if len(digits) == 15 else ""
+
+    # Default fallback: return full answer
+    return answer
+
 # --- Secure Google Sheets helpers ---
 SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
 
@@ -386,6 +420,45 @@ logging.getLogger("apscheduler").setLevel(logging.INFO)
 scheduler = BackgroundScheduler(jobstores=jobstores, timezone=EASTERN)
 scheduler.start()
 logging.info("[Scheduler] Started with job store at /var/data/scheduled_jobs.sqlite")
+
+from urllib.parse import urlencode
+from twilio.rest import Client
+
+TWILIO_NUMBER = os.getenv("TWILIO_NUMBER")
+BASE_URL = "https://cpr-voice-leads-bot.onrender.com"  # your Render URL
+
+def start_outbound_call(lead: dict):
+    # Split name into first/last if possible
+    name_parts = lead.get("name", "").strip().split(" ", 1)
+    first_name = name_parts[0] if name_parts else ""
+    last_name = name_parts[1] if len(name_parts) > 1 else ""
+
+    # Build query params to seed verification flow
+    params = urlencode({
+        "stage": "intro",
+        "day": "",  # fill if you have it
+        "time_slot": "",  # fill if you have it
+        "first_name": first_name,
+        "last_name": last_name,
+        "phone": lead.get("phone", ""),
+        "email": lead.get("email", ""),  # include if present in lead
+        "device_model": lead.get("device", ""),
+        "diagnostic": lead.get("repair_type", ""),
+        "imei": lead.get("imei", "")
+    })
+
+    verify_url = f"{BASE_URL}/voice/inbound/verify?{params}"
+
+    print(f"[Outbound Call] Starting call to {lead.get('phone')} with URL: {verify_url}")
+
+    # Twilio REST client
+    client = Client(os.getenv("TWILIO_SID"), os.getenv("TWILIO_AUTH_TOKEN"))
+    call = client.calls.create(
+        to=lead["phone"],
+        from_=TWILIO_NUMBER,
+        url=verify_url
+    )
+    print(f"[Outbound Call] Twilio call SID: {call.sid}")
 
 
 def should_call_now():
@@ -700,10 +773,32 @@ async def lead_intake(
                         email=email, zip_code=zip_code, referral=answer)
 
     if not imei:
-        imei_value = "" if answer.lower() in ["no", "nah", "none"] else answer
-        return repeat_q("Do you have a passcode for the device? If not, say no.",
+        lower = answer.lower()
+        digits_only = re.sub(r"\D", "", answer)
+
+        # Handle skip phrases
+        if any(phrase in lower for phrase in ["no", "nah", "none", "don't have", "do not have", "not available", "skip"]):
+            return repeat_q("No problem. Do you have a passcode for the device? If not, say no.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                            email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
+
+        # Handle stall phrases
+        if any(phrase in lower for phrase in ["hold on", "hang on", "give me a minute", "one sec", "just a second"]):
+            return repeat_q("Sure, take your time. When you're ready, please read out the fifteen-digit I M E I number clearly, digit by digit.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                            email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
+
+
+        # Validate IMEI
+        if len(digits_only) == 15:
+            return repeat_q("Got it. Do you have a passcode for the device? If not, say no.",
+                            first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
+                            email=email, zip_code=zip_code, referral=referral, imei=digits_only, device_model="")
+
+        # Incomplete or unclear
+        return repeat_q("I only heard part of the number. Please read your complete fifteen-digit I M E I number, digit by digit.",
                         first_name=first_name, last_name=last_name, phone=phone, alt_phone=alt_phone,
-                        email=email, zip_code=zip_code, referral=referral, imei=imei_value, device_model="")
+                        email=email, zip_code=zip_code, referral=referral, imei="", device_model="")
 
     if not passcode:
         passcode_value = "" if answer.lower() in ["no", "nah", "none"] else answer
