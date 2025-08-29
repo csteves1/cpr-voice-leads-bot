@@ -1,4 +1,4 @@
-import os, re, json, base64
+import re, base64
 from fastapi import FastAPI, Request
 from fastapi.responses import Response
 from twilio.twiml.voice_response import VoiceResponse, Gather
@@ -17,7 +17,6 @@ from openai import OpenAI
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 from urllib.parse import urlencode
 from twilio.rest import Client
-import os
 import os
 import json
 import gspread
@@ -116,7 +115,6 @@ def check_utilities(answer: str, lead_state: dict, current_route: str, stage: st
     # === Inventory check ===
     if "in stock" in lower or "have" in lower or "availability" in lower:
         try:
-            import gspread, json, os
             creds_json = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
             if not creds_json:
                 print("[WARN] No Google Sheets creds in env var GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
