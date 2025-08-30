@@ -302,7 +302,6 @@ REQUIRED_FIELDS = [
     "first_name",
     "last_name",
     "phone",
-    "alt_phone",
     "email",
     "zip_code",
     "referral",
@@ -318,7 +317,6 @@ FIELD_PROMPTS = {
     "first_name": "What's your first name?",
     "last_name": "What's your last name?",
     "phone": "What's the best phone number to reach you?",
-    "alt_phone": "Do you have an alternate phone number? If not, just say no.",
     "email": "What's your email address?",
     "zip_code": "What's your zip code?",
     "referral": "How did you hear about us?",
@@ -383,7 +381,6 @@ def read_back_summary(lead_state: dict) -> str:
         f"First name: {safe(lead_state.get('first_name'))}",
         f"Last name: {safe(lead_state.get('last_name'))}",
         f"Primary phone: {safe(lead_state.get('phone'))}",
-        f"Alternate phone: {safe(lead_state.get('alt_phone'))}",
         f"Email: {safe(lead_state.get('email'))}",
         f"Zip code: {safe(lead_state.get('zip_code'))}",
         f"Referral: {safe(lead_state.get('referral'))}",
@@ -709,7 +706,7 @@ def extract_value(answer: str, field: str) -> str:
         return match.group(0) if match else ""
 
     # If it's a phone number, grab digits
-    if field in ["phone", "alt_phone"]:
+    if field in ["phone"]:
         digits = re.sub(r"\D", "", answer)
         return digits if len(digits) >= 7 else ""
 
@@ -755,7 +752,6 @@ def save_mock_ticket(data: dict):
             data.get("first_name", ""),
             data.get("last_name", ""),
             data.get("phone", ""),
-            data.get("alt_phone", ""),
             data.get("email", ""),
             data.get("zip_code", ""),
             data.get("referral", ""),
@@ -947,6 +943,8 @@ def schedule_lead_call(lead):
             misfire_grace_time=600  # 10‑minute grace if app is down briefly
         )
 
+from urllib.parse import urlencode
+
 @app.post("/voice/inbound/start")
 async def inbound_start(req: Request):
     """True entry point for brand‑new inbound calls."""
@@ -986,7 +984,6 @@ async def inbound_start(req: Request):
     yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/inbound/start")
     if yes_response:
         return yes_response
-
     no_response = handle_no(answer, lead_state, stage, current_route="/voice/inbound")
     if no_response:
         return no_response
@@ -1002,7 +999,7 @@ async def inbound_start(req: Request):
         vr = VoiceResponse()
         g = Gather(
             input="speech",
-            action="/voice/outbound/lead/intake?stage=day",  # first booking stage
+            action=f"/voice/outbound/lead/intake?stage=day&{urlencode(lead_state)}",
             method="POST",
             timeout=30,
             speech_timeout="auto",
@@ -1013,7 +1010,7 @@ async def inbound_start(req: Request):
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 6) Price intent
+    # 5) Price intent
     if "price" in lower or "cost" in lower or "how much" in lower:
         return repeat_q(
             "Sure, what device and repair type would you like a price for?",
@@ -1022,12 +1019,12 @@ async def inbound_start(req: Request):
             **lead_state
         )
 
-        # Directions intent (spoken + landmarks, then ask if they want a link)
+    # 6) Directions intent
     if "direction" in lower or "where" in lower or "address" in lower or "location" in lower:
         vr = VoiceResponse()
         g = Gather(
             input="speech",
-            action="/voice/inbound/send_map_link",
+            action=f"/voice/inbound/send_map_link?{urlencode(lead_state)}",
             method="POST",
             timeout=25,
             speech_timeout="auto",
@@ -1044,24 +1041,36 @@ async def inbound_start(req: Request):
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 8) Catch‑all → general inbound Q&A
+    # 7) General store info intent
+    if "info" in lower or "information" in lower or "store" in lower:
+        vr = VoiceResponse()
+        say_human(
+            vr,
+            f"We are CPR Cell Phone Repair in Myrtle Beach, located at {STORE_INFO['address']}. "
+            f"Our hours are {STORE_INFO['hours']}, and our phone number is {STORE_INFO['phone']}."
+        )
+        vr.redirect(f"/voice/inbound/post_booking_choice?{urlencode(lead_state)}")
+        return Response(str(vr), media_type="application/xml")
+
+    # 8) Catch‑all → send to AI Q&A
     vr = VoiceResponse()
-    vr.redirect("/voice/inbound")
+    vr.redirect(f"/voice/inbound/process?{urlencode(lead_state)}")
     return Response(str(vr), media_type="application/xml")
 
 @app.post("/voice/inbound/post_booking_choice")
 async def post_booking_choice(req: Request):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip().lower()
+    lead_state = build_lead_state(**{f: form.get(f, "") for f in REQUIRED_FIELDS})
 
     vr = VoiceResponse()
 
     if any(word in answer for word in ["yes", "yeah", "yep", "sure", "please", "ok", "okay"]):
-        vr.redirect("/voice/outbound/lead/intake")
+        vr.redirect(f"/voice/outbound/lead/intake?{urlencode(lead_state)}")
     elif "menu" in answer or "main" in answer or "start" in answer:
-        vr.redirect("/voice/inbound/start")
+        vr.redirect(f"/voice/inbound/start?{urlencode(lead_state)}")
     else:
-        vr.redirect("/voice/inbound")  # AI Q&A
+        vr.redirect(f"/voice/inbound?{urlencode(lead_state)}")  # AI Q&A
 
     return Response(str(vr), media_type="application/xml")
 
@@ -1074,17 +1083,16 @@ async def send_map_link(req: Request):
 
     vr = VoiceResponse()
 
-    # If they want the link, send it
     if any(word in answer for word in ["yes", "yeah", "yep", "sure", "please", "ok", "okay"]):
         to_number = lead_state.get("phone") or form.get("From") or DEFAULT_PHONE_FALLBACK
         send_sms(to_number, f"Here’s a map to our store: {MAPS_LINK}")
         say_human(vr, "Okay, I just sent you a text with the map link.")
     else:
         say_human(vr, "No problem, I won’t send a text.")
-    # Now ask if they want to book, but route to a choice handler
+
     g = Gather(
         input="speech",
-        action="/voice/inbound/post_booking_choice",  # new route
+        action=f"/voice/inbound/post_booking_choice?{urlencode(lead_state)}",
         method="POST",
         timeout=20,
         speech_timeout="auto",
@@ -1097,9 +1105,27 @@ async def send_map_link(req: Request):
 
 
 @app.post("/voice/inbound/store_info")
-async def store_info(req: Request):
+async def store_info(
+    req: Request,
+    day: str = "", time_slot: str = "",
+    first_name: str = "", last_name: str = "",
+    phone: str = "", email: str = "",
+    zip_code: str = "", referral: str = "",
+    imei: str = "", device_model: str = "",
+    passcode: str = "", diagnostic: str = "",
+    stage: str = "", reported_model: str = ""
+):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip().lower()
+
+    lead_state = build_lead_state(
+        day=day, time_slot=time_slot,
+        first_name=first_name, last_name=last_name,
+        phone=phone, email=email,
+        zip_code=zip_code, referral=referral,
+        imei=imei, device_model=device_model,
+        passcode=passcode, diagnostic=diagnostic
+    )
 
     vr = VoiceResponse()
 
@@ -1110,13 +1136,8 @@ async def store_info(req: Request):
     elif "phone" in answer or "number" in answer or "call" in answer:
         say_human(vr, "Our phone number is 843-750-0449.")
     else:
-        # Fallback to AI Q&A if they ask something else
-        vr.redirect("/voice/inbound")
+        vr.redirect(f"/voice/inbound?{urlencode(lead_state)}")
         return Response(str(vr), media_type="application/xml")
-
-    # After giving the info, offer a next step
-    say_human(vr, "Would you like directions or to book a repair?")
-    return Response(str(vr), media_type="application/xml")
 
 @app.post("/webhooks/repairq/lead")
 async def repairq_lead(req: Request):
@@ -1238,7 +1259,6 @@ async def lead_intake(
     first_name: str = "",
     last_name: str = "",
     phone: str = "",
-    alt_phone: str = "",
     email: str = "",
     zip_code: str = "",
     referral: str = "",
@@ -1251,32 +1271,39 @@ async def lead_intake(
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
+    lower = answer.lower()
+
+    # Allow exit at any stage
+    if any(word in lower for word in ["stop", "cancel", "end booking", "quit", "exit"]):
+        vr = VoiceResponse()
+        say_human(vr, "No problem, I’ve cancelled the booking. You can still ask me about our services or store info.")
+        vr.redirect("/voice/inbound/start")
+        return Response(str(vr), media_type="application/xml")
 
     # Build lead_state once and reuse
     lead_state = build_lead_state(
         day=day, time_slot=time_slot,
         first_name=first_name, last_name=last_name,
-        phone=phone, alt_phone=alt_phone, email=email,
+        phone=phone, email=email,
         zip_code=zip_code, referral=referral,
         imei=imei, device_model=device_model,
         passcode=passcode, diagnostic=diagnostic
     )
 
-    # 1) Utilities first
+    # Utilities first
     util = check_utilities(answer, lead_state, current_route="/voice/outbound/lead/intake", stage=stage)
     if util:
         return util
 
-    # 2) Global YES handling for confirm_summary
+    # YES/NO handling for confirm_summary
     yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/outbound/lead/intake")
     if yes_response:
         return yes_response
-
     no_response = handle_no(answer, lead_state, stage, current_route="/voice/inbound")
     if no_response:
         return no_response
-    
-    # 3) NO handling
+
+    # NO at confirm_summary
     if stage == "confirm_summary" and wants_no(answer):
         return repeat_q(
             "Which field do you want to change? For example: day, time, email, or device model.",
@@ -1285,7 +1312,7 @@ async def lead_intake(
             **lead_state
         )
 
-    # 4) Unclear answer at confirm_summary → re‑read summary
+    # Unclear at confirm_summary → re‑read
     if stage == "confirm_summary":
         return repeat_q(
             read_back_summary(lead_state),
@@ -1294,7 +1321,7 @@ async def lead_intake(
             **lead_state
         )
 
-    # 5) Field‑level correction target
+    # Field‑level correction target
     if stage == "correction_target":
         field_map = {
             "day": "day", "date": "day",
@@ -1302,7 +1329,6 @@ async def lead_intake(
             "first": "first_name", "first name": "first_name",
             "last": "last_name", "last name": "last_name",
             "phone": "phone", "primary": "phone",
-            "alternate": "alt_phone", "alt": "alt_phone",
             "email": "email",
             "zip": "zip_code", "zip code": "zip_code",
             "referral": "referral",
@@ -1311,7 +1337,7 @@ async def lead_intake(
             "passcode": "passcode", "code": "passcode",
             "diagnostic": "diagnostic", "issue": "diagnostic"
         }
-        key = (answer or "").lower().strip()
+        key = lower.strip()
         target = field_map.get(key)
         if not target:
             for k, v in field_map.items():
@@ -1325,7 +1351,6 @@ async def lead_intake(
                 stage="correction_target",
                 **lead_state
             )
-
         return repeat_q(
             f"Okay, what's the correct {target.replace('_', ' ')}?",
             action_path="/voice/outbound/lead/intake",
@@ -1333,13 +1358,50 @@ async def lead_intake(
             **lead_state
         )
 
-    # 6) Core progression
+    # IMEI validation stage
+    if stage == "imei":
+        # Strip all non‑digits
+        imei_digits = re.sub(r"\D", "", answer)
+        if len(imei_digits) != 15:
+            return repeat_q(
+                "No problem, but that doesn’t look like a valid IMEI. It should be 15 digits. Could you read it again slowly?",
+                action_path="/voice/outbound/lead/intake",
+                stage="imei",
+                timeout=30, speech_timeout="auto",
+                **lead_state
+            )
+        lead_state["imei"] = imei_digits
+        # Move to next stage
+        vr = VoiceResponse()
+        vr.redirect(f"/voice/outbound/lead/intake?stage=device_model&{urlencode(lead_state)}")
+        return Response(str(vr), media_type="application/xml")
+
+    # Optional fields skip handling
+    if stage in ["passcode", "diagnostic", "referral"]:
+        if any(word in lower for word in ["no", "nope", "nah", "skip"]):
+            say_human(VoiceResponse(), "No problem.")
+            next_stage = "diagnostic" if stage == "passcode" else "referral" if stage == "diagnostic" else "final"
+            vr = VoiceResponse()
+            if next_stage == "final":
+                vr.redirect(f"/voice/inbound/verify?{urlencode(lead_state)}")
+            else:
+                vr.redirect(f"/voice/outbound/lead/intake?stage={next_stage}&{urlencode(lead_state)}")
+            return Response(str(vr), media_type="application/xml")
+
+    # Core progression
     result = handle_field_progression(
         answer=answer,
         stage=stage,
         reported_model=reported_model,
         **lead_state
     )
+
+    # If final stage reached → go to verify
+    if stage == "final" or (result and result.get("stage") == "final"):
+        vr = VoiceResponse()
+        vr.redirect(f"/voice/inbound/verify?{urlencode(lead_state)}")
+        return Response(str(vr), media_type="application/xml")
+
     if result and result.get("prompt") and result.get("lead_state"):
         return repeat_q(
             result["prompt"],
@@ -1351,100 +1413,18 @@ async def lead_intake(
             **result["lead_state"]
         )
 
-    # 7) Failsafe
+    # Failsafe
     return repeat_q(
         "Sorry, I didn’t catch that. Could you repeat?",
         action_path="/voice/outbound/lead/intake",
         **lead_state
     )
-
-@app.post("/voice/inbound")
-async def voice_inbound(req: Request, **state):
-    """Entry point after booking to handle general phone repair questions."""
-    form = await req.form()
-    answer = (form.get("SpeechResult") or "").strip()
-    print(f"[Inbound Q&A] answer={answer}")
-
-    # Build current state so we can preserve context if they branch to intake
-    lead_state = build_lead_state(**{f: state.get(f, "") for f in REQUIRED_FIELDS})
-    stage = state.get("stage", "")
-
-    # 🔹 NEW: If we just came from a booking confirmation, skip booking intro
-    if stage == "post_booking":
-        vr = VoiceResponse()
-        g = Gather(
-            input="speech",
-            action="/voice/inbound",
-            method="POST",
-            timeout=30,             # total wait time
-            speech_timeout="auto",  # or "15" if you want longer pauses
-            speech_model="phone_call"
-        )
-        say_human(
-            g,
-            "What else would you like to know? You can ask about our hours, location, "
-            "how long repairs take, a price, or our services."
-        )
-        vr.append(g)
-        return Response(str(vr), media_type="application/xml")
-
-    # 1) Utilities first — directions, hours, address, phone, price, etc.
-    util = check_utilities(answer, lead_state, current_route="/voice/inbound", stage=stage)
-    if util:
-        return util
-
-    # 2) Global YES handling
-    yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/inbound")
-    if yes_response:
-        return yes_response
-
-    no_response = handle_no(answer, lead_state, stage, current_route="/voice/inbound")
-    if no_response:
-        return no_response
-    
-    vr = VoiceResponse()
-
-    # 3) First turn – greet and invite a question
-    if not answer:
-        g = Gather(
-            input="speech",
-            action="/voice/inbound",
-            method="POST",
-            timeout=25,
-            speech_timeout="auto",
-            speech_model="phone_call"
-        )
-        say_human(
-            g,
-            "What would you like to know? You can ask about our hours, our location, "
-            "how long repairs take, a price, or start a booking."
-        )
-        vr.append(g)
-        return Response(str(vr), media_type="application/xml")
-
-    lower = answer.lower()
-
-    # 4) Legacy quick fixed answers
-    if "hour" in lower:
-        say_human(vr, f"Our hours are {STORE_INFO['hours']}.")
-    elif "location" in lower or "address" in lower or "where" in lower:
-        say_human(vr, f"We're at {STORE_INFO['address']}.")
-    elif "how long" in lower or "long" in lower or "turnaround" in lower:
-        say_human(vr, "We usually quote repairs at 1 to 2 hours once we begin work.")
-    else:
-        # 5) Hand off to your AI repair Q&A flow
-        vr.redirect("/voice/inbound/process")
-        return Response(str(vr), media_type="application/xml")
-    # 6) After answering, loop back so they can ask more
-    vr.redirect("/voice/inbound")
-    return Response(str(vr), media_type="application/xml")
-
 @app.post("/voice/inbound/verify")
 async def inbound_verify(
     req: Request,
     day: str = "", time_slot: str = "",
     first_name: str = "", last_name: str = "",
-    phone: str = "", alt_phone: str = "", email: str = "",
+    phone: str = "", email: str = "",
     zip_code: str = "", referral: str = "",
     imei: str = "", device_model: str = "",
     passcode: str = "", diagnostic: str = "",
@@ -1453,31 +1433,38 @@ async def inbound_verify(
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
+    lower = answer.lower()
+
+    # Allow exit at any stage
+    if any(word in lower for word in ["stop", "cancel", "end booking", "quit", "exit"]):
+        vr = VoiceResponse()
+        say_human(vr, "No problem, I’ve cancelled the booking. You can still ask me about our services or store info.")
+        vr.redirect("/voice/inbound/start")
+        return Response(str(vr), media_type="application/xml")
 
     lead_state = build_lead_state(
         day=day, time_slot=time_slot,
         first_name=first_name, last_name=last_name,
-        phone=phone, alt_phone=alt_phone, email=email,
+        phone=phone, email=email,
         zip_code=zip_code, referral=referral,
         imei=imei, device_model=device_model,
         passcode=passcode, diagnostic=diagnostic
     )
 
-    # 1) Utilities first
+    # Utilities first
     util = check_utilities(answer, lead_state, current_route="/voice/inbound/verify", stage=stage)
     if util:
         return util
 
-    # 2) Global YES handling
+    # Global YES/NO handling
     yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/inbound/verify")
     if yes_response:
         return yes_response
-
     no_response = handle_no(answer, lead_state, stage, current_route="/voice/inbound")
     if no_response:
         return no_response
-    
-    # 3) Correction stage
+
+    # Correction target stage
     if stage == "correction_target":
         field_map = {
             "day": "day", "date": "day",
@@ -1485,7 +1472,6 @@ async def inbound_verify(
             "first": "first_name", "first name": "first_name",
             "last": "last_name", "last name": "last_name",
             "phone": "phone", "primary": "phone",
-            "alternate": "alt_phone", "alt": "alt_phone",
             "email": "email",
             "zip": "zip_code", "zip code": "zip_code",
             "referral": "referral",
@@ -1494,7 +1480,7 @@ async def inbound_verify(
             "passcode": "passcode", "code": "passcode",
             "diagnostic": "diagnostic", "issue": "diagnostic"
         }
-        key = (answer or "").lower().strip()
+        key = lower.strip()
         target = field_map.get(key)
         if not target:
             for k, v in field_map.items():
@@ -1517,7 +1503,7 @@ async def inbound_verify(
             **lead_state
         )
 
-    # 4) First time in? Read back summary
+    # First time in? Read back summary
     if not stage:
         return repeat_q(
             read_back_summary(lead_state),
@@ -1527,7 +1513,7 @@ async def inbound_verify(
             **lead_state
         )
 
-    # 5) NO at confirm_summary
+    # NO at confirm_summary
     if stage == "confirm_summary" and wants_no(answer):
         return repeat_q(
             "Which field would you like to change?",
@@ -1537,7 +1523,7 @@ async def inbound_verify(
             **lead_state
         )
 
-    # 6) Unclear at confirm_summary → re‑read
+    # Unclear at confirm_summary → re‑read
     if stage == "confirm_summary":
         return repeat_q(
             read_back_summary(lead_state),
@@ -1547,7 +1533,46 @@ async def inbound_verify(
             **lead_state
         )
 
-    # 7) Progression for remaining fields
+    # Phone number validation
+    if stage == "phone":
+        digits = re.sub(r"\D", "", answer)
+        if len(digits) != 10:
+            return repeat_q(
+                "No problem, but that doesn’t look like a valid phone number. Could you repeat it using 10 digits?",
+                action_path="/voice/inbound/verify",
+                stage="phone",
+                timeout=30, speech_timeout="auto",
+                **lead_state
+            )
+        lead_state["phone"] = digits
+
+    # IMEI validation
+    if stage == "imei":
+        imei_digits = re.sub(r"\D", "", answer)
+        if len(imei_digits) != 15:
+            return repeat_q(
+                "No problem, but that doesn’t look like a valid IMEI. It should be 15 digits. Could you read it again slowly?",
+                action_path="/voice/inbound/verify",
+                stage="imei",
+                timeout=30, speech_timeout="auto",
+                **lead_state
+            )
+        lead_state["imei"] = imei_digits
+
+    # Optional fields skip handling
+    if stage in ["passcode", "diagnostic", "referral"]:
+        if any(word in lower for word in ["no", "nope", "nah", "skip"]):
+            say_human(VoiceResponse(), "No problem.")
+            # Move to next logical stage or finish
+            next_stage = "diagnostic" if stage == "passcode" else "referral" if stage == "diagnostic" else "final"
+            vr = VoiceResponse()
+            if next_stage == "final":
+                vr.redirect(f"/voice/inbound/verify?{urlencode(lead_state)}")
+            else:
+                vr.redirect(f"/voice/inbound/verify?stage={next_stage}&{urlencode(lead_state)}")
+            return Response(str(vr), media_type="application/xml")
+
+    # Progression for remaining fields
     result = handle_field_progression(
         answer=answer,
         stage=stage,
@@ -1555,7 +1580,7 @@ async def inbound_verify(
         **lead_state
     )
 
-    # Save progress on every update
+    # Save progress
     try:
         save_mock_ticket(result["lead_state"])
     except Exception as e:
@@ -1571,14 +1596,13 @@ async def inbound_verify(
             **result["lead_state"]
         )
 
-    # 8) Failsafe
+    # Failsafe
     return repeat_q(
         "Sorry, I didn’t catch that. Could you repeat?",
         action_path="/voice/inbound/verify",
         timeout=30, speech_timeout="auto",
         **lead_state
     )
-
 # Health check
 @app.get("/health")
 def health():
