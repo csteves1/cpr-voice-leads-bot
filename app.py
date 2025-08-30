@@ -16,6 +16,7 @@ from urllib.parse import urlencode
 from openai import OpenAI
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 from urllib.parse import urlencode
+from pricing_helpers import handle_price_intent
 import json
 import gspread
 

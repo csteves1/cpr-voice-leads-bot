@@ -1,17 +1,8 @@
-# pricing_helpers.py
-
-from app import lookup_price, lookup_price_rows, gather_booking_choice, STORE_INFO, openai_client
+from shared import lookup_price, lookup_price_rows, gather_booking_choice, STORE_INFO, openai_client
 
 def handle_price_intent(user_input: str, lead_state: dict):
-    """
-    Unified price intent handler:
-    1. Try Google Sheet lookup.
-    2. If found → quote + booking choice.
-    3. If not found → AI fallback with sheet data.
-    """
     lower = (user_input or "").lower()
 
-    # 1) Try sheet lookup
     match = lookup_price(lower)
     if match:
         return gather_booking_choice(
@@ -20,7 +11,6 @@ def handle_price_intent(user_input: str, lead_state: dict):
             lead_state
         )
 
-    # 2) AI fallback with sheet data
     price_rows = lookup_price_rows() or []
     if not price_rows:
         return gather_booking_choice(
