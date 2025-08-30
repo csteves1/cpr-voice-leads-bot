@@ -1251,23 +1251,33 @@ async def outbound_lead_process(req: Request, **state):
         action_path="/voice/outbound/lead/process",
         **state
     )
+from datetime import datetime
+import re, dateparser
+
+OPEN_DAYS = [0, 1, 2, 3, 4, 5]  # Mon–Sat
+OPEN_HOUR = 9
+CLOSE_HOUR = 18
+
+def validate_date_time(day_str, time_str):
+    dt = dateparser.parse(f"{day_str} {time_str}")
+    if not dt:
+        return False, "I couldn’t understand that date and time."
+    if dt.weekday() not in OPEN_DAYS:
+        return False, "We’re closed on Sundays. Please choose Monday through Saturday."
+    if not (OPEN_HOUR <= dt.hour < CLOSE_HOUR):
+        return False, f"We’re open between {OPEN_HOUR} AM and {CLOSE_HOUR} PM."
+    return True, None
+
 @app.post("/voice/outbound/lead/intake")
 async def lead_intake(
     req: Request,
-    day: str = "",
-    time_slot: str = "",
-    first_name: str = "",
-    last_name: str = "",
-    phone: str = "",
-    email: str = "",
-    zip_code: str = "",
-    referral: str = "",
-    imei: str = "",
-    device_model: str = "",
-    passcode: str = "",
-    diagnostic: str = "",
-    stage: str = "",
-    reported_model: str = ""
+    day: str = "", time_slot: str = "",
+    first_name: str = "", last_name: str = "",
+    phone: str = "", email: str = "",
+    zip_code: str = "", referral: str = "",
+    imei: str = "", device_model: str = "",
+    passcode: str = "", diagnostic: str = "",
+    stage: str = "", reported_model: str = ""
 ):
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
@@ -1277,10 +1287,10 @@ async def lead_intake(
     if any(word in lower for word in ["stop", "cancel", "end booking", "quit", "exit"]):
         vr = VoiceResponse()
         say_human(vr, "No problem, I’ve cancelled the booking. You can still ask me about our services or store info.")
-        vr.redirect("/voice/inbound/start")
+        vr.redirect(f"/voice/inbound/start?{urlencode(build_lead_state(**{f: '' for f in REQUIRED_FIELDS}))}")
         return Response(str(vr), media_type="application/xml")
 
-    # Build lead_state once and reuse
+    # Build lead_state
     lead_state = build_lead_state(
         day=day, time_slot=time_slot,
         first_name=first_name, last_name=last_name,
@@ -1295,7 +1305,7 @@ async def lead_intake(
     if util:
         return util
 
-    # YES/NO handling for confirm_summary
+    # Global YES/NO handling
     yes_response = handle_yes(answer, lead_state, stage, current_route="/voice/outbound/lead/intake")
     if yes_response:
         return yes_response
@@ -1303,25 +1313,16 @@ async def lead_intake(
     if no_response:
         return no_response
 
-    # NO at confirm_summary
-    if stage == "confirm_summary" and wants_no(answer):
+    # Global "go back/change" handling
+    if any(kw in lower for kw in ["go back", "change", "edit", "update"]):
         return repeat_q(
-            "Which field do you want to change? For example: day, time, email, or device model.",
+            "Which field would you like to change?",
             action_path="/voice/outbound/lead/intake",
             stage="correction_target",
             **lead_state
         )
 
-    # Unclear at confirm_summary → re‑read
-    if stage == "confirm_summary":
-        return repeat_q(
-            read_back_summary(lead_state),
-            action_path="/voice/outbound/lead/intake",
-            stage="confirm_summary",
-            **lead_state
-        )
-
-    # Field‑level correction target
+    # Correction target stage
     if stage == "correction_target":
         field_map = {
             "day": "day", "date": "day",
@@ -1346,7 +1347,7 @@ async def lead_intake(
                     break
         if not target:
             return repeat_q(
-                "Sorry, which field should I change? For example say: day, time, email, phone, or device model.",
+                "Sorry, which field should I change?",
                 action_path="/voice/outbound/lead/intake",
                 stage="correction_target",
                 **lead_state
@@ -1358,23 +1359,51 @@ async def lead_intake(
             **lead_state
         )
 
-    # IMEI validation stage
+    # Field-specific validations
+    if stage == "day":
+        lead_state["day"] = answer
+        valid, msg = validate_date_time(answer, time_slot)
+        if not valid:
+            return repeat_q(msg, action_path="/voice/outbound/lead/intake", stage="day", **lead_state)
+
+    if stage == "time_slot":
+        lead_state["time_slot"] = answer
+        valid, msg = validate_date_time(day, answer)
+        if not valid:
+            return repeat_q(msg, action_path="/voice/outbound/lead/intake", stage="time_slot", **lead_state)
+
+    if stage == "phone":
+        digits = re.sub(r"\D", "", answer)
+        if len(digits) != 10:
+            return repeat_q(
+                "No problem, but that doesn’t look like a valid phone number. Could you repeat it using 10 digits?",
+                action_path="/voice/outbound/lead/intake",
+                stage="phone",
+                **lead_state
+            )
+        lead_state["phone"] = digits
+
+    if stage == "email":
+        if not re.match(r"[^@]+@[^@]+\.[^@]+", answer):
+            return repeat_q(
+                "That doesn’t look like a valid email. Could you repeat it?",
+                action_path="/voice/outbound/lead/intake",
+                stage="email",
+                **lead_state
+            )
+        lead_state["email"] = answer
+
     if stage == "imei":
-        # Strip all non‑digits
         imei_digits = re.sub(r"\D", "", answer)
         if len(imei_digits) != 15:
             return repeat_q(
                 "No problem, but that doesn’t look like a valid IMEI. It should be 15 digits. Could you read it again slowly?",
                 action_path="/voice/outbound/lead/intake",
                 stage="imei",
-                timeout=30, speech_timeout="auto",
+                timeout=30, speech_timeout="10",  # more patient
                 **lead_state
             )
         lead_state["imei"] = imei_digits
-        # Move to next stage
-        vr = VoiceResponse()
-        vr.redirect(f"/voice/outbound/lead/intake?stage=device_model&{urlencode(lead_state)}")
-        return Response(str(vr), media_type="application/xml")
 
     # Optional fields skip handling
     if stage in ["passcode", "diagnostic", "referral"]:
@@ -1419,6 +1448,7 @@ async def lead_intake(
         action_path="/voice/outbound/lead/intake",
         **lead_state
     )
+
 @app.post("/voice/inbound/verify")
 async def inbound_verify(
     req: Request,
