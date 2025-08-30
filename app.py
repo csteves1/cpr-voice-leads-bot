@@ -77,10 +77,22 @@ def gather_booking_choice(prompt_text: str, lead_state: dict):
     vr.append(g)
     return Response(str(vr), media_type="application/xml")
 
+from pricing_helpers import handle_price_intent as _handle_price_intent
 
+def handle_price_intent(user_input, lead_state):
+    return _handle_price_intent(
+        user_input,
+        lead_state,
+        lookup_price,
+        lookup_price_rows,
+        gather_booking_choice,
+        STORE_INFO,
+        openai_client
+    )
 
 def check_utilities(answer: str, lead_state: dict, current_route: str, stage: str):
     lower = (answer or "").lower()
+    vr = VoiceResponse()
 
     # === Global Goodbye Detection ===
     if any(bye in lower for bye in [
@@ -91,14 +103,12 @@ def check_utilities(answer: str, lead_state: dict, current_route: str, stage: st
         "nothing else", "nope", "nah", "all set", "we're done",
         "im done", "i am done", "done"
     ]):
-        vr = VoiceResponse()
         say_human(vr, "Alright, thanks for calling. Have a great day!")
         vr.hangup()
         return Response(str(vr), media_type="application/xml")
 
     # === Directions with landmarks, then ask if they want a link ===
     if "direction" in lower or "map" in lower:
-        vr = VoiceResponse()
         g = Gather(
             input="speech",
             action="/voice/inbound/send_map_link",
@@ -146,23 +156,9 @@ def check_utilities(answer: str, lead_state: dict, current_route: str, stage: st
             lead_state
         )
 
-    # === Price lookup ===
-    if "price" in lower or "quote" in lower:
-        spoken = norm_text(lower)
-        match = lookup_price(spoken)
-        if match:
-            return gather_booking_choice(
-                f"The current price for {match['Device']} {match['RepairType']} is ${match['Price']}. "
-                "Would you like to book that?",
-                lead_state
-            )
-        else:
-            return repeat_q(
-                "Could you tell me the exact device model and repair type?",
-                action_path="/voice/outbound/lead/intake",
-                stage="device_model",
-                **lead_state
-            )
+    # === Price lookup (unified helper) ===
+    if any(p in lower for p in ["price", "cost", "how much", "quote"]):
+        return handle_price_intent(answer, lead_state)
 
     # === Inventory check ===
     if "in stock" in lower or "have" in lower or "availability" in lower:
@@ -203,6 +199,7 @@ def check_utilities(answer: str, lead_state: dict, current_route: str, stage: st
             )
 
     return None  # No match, continue progression
+
 def repeat_q(prompt, day="", time_slot="", **kwargs):
     # Preserve booking day/time slot unless overridden
     kwargs.setdefault("day", day)
@@ -783,12 +780,12 @@ async def voice_process(req: Request):
     lead_state = build_lead_state(**{f: req.query_params.get(f, "") for f in REQUIRED_FIELDS})
     stage = req.query_params.get("stage", "")
 
-    # Utilities & goodbye first
+    # 1) Utilities & goodbye first
     util = check_utilities(user_input, lead_state, current_route="/voice/inbound/process", stage=stage)
     if util:
         return util
 
-    # Global YES/NO handling
+    # 2) Global YES/NO handling
     yes_response = handle_yes(user_input, lead_state, stage, current_route="/voice/inbound/process")
     if yes_response:
         return yes_response
@@ -796,30 +793,31 @@ async def voice_process(req: Request):
     if no_response:
         return no_response  
 
-    # Price match branch
-    repair_keywords = [
-        "repair","screen","battery","cracked","broken","device","phone","tablet",
-        "hours","address","location","directions","price","quote","appointment"
+    # 3) PRICE intent FIRST
+    if any(p in lower for p in ["price", "cost", "how much", "quote"]):
+        return handle_price_intent(user_input, lead_state)
+    
+    # 4) Booking intent detection (only if NOT a price question)
+    booking_keywords = [
+        "book", "appointment", "repair", "fix", "replace",
+        "yes", "start", "schedule"
     ]
-    if any(t in lower for t in repair_keywords):
-        match = lookup_price(lower)
-        if match:
-            say_human(vr, f"The current price for {match['Device']} {match['RepairType']} is ${match['Price']}.")
-            return Response(
-                str(say_and_listen(vr, "Anything else I can help with?")),
-                media_type="application/xml"
-            )
-        else:
-            return Response(
-                str(say_and_listen(
-                    vr,
-                    "Could you tell me the exact device model, like 'Samsung Galaxy S23 Ultra' or 'iPhone 13 Pro'?",
-                    action="/voice/inbound/process"
-                )),
-                media_type="application/xml"
-            )
+    if any(word in lower for word in booking_keywords):
+        vr = VoiceResponse()
+        g = Gather(
+            input="speech",
+            action=f"/voice/outbound/lead/intake?stage=day&{urlencode(lead_state)}",
+            method="POST",
+            timeout=30,
+            speech_timeout="auto",
+            speech_model="phone_call"
+        )
+        say_human(g, "Great, let's get some details for your booking.")
+        say_human(g, "What day would you like to come in?")
+        vr.append(g)
+        return Response(str(vr), media_type="application/xml")
 
-    # Fallback to LLM
+    # 5) Fallback to LLM Q&A
     system_prompt = f"""
     You are the receptionist for {STORE_INFO['name']} in {STORE_INFO['city']}.
     Stay strictly on store/services/repairs. Keep answers to 1–3 sentences.
@@ -832,7 +830,6 @@ async def voice_process(req: Request):
     out = openai_client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
     text = out.choices[0].message.content.strip()
     return Response(str(say_and_listen(vr, text)), media_type="application/xml")
-
 
 from datetime import datetime, timedelta
 import pytz
@@ -937,15 +934,15 @@ from urllib.parse import urlencode
 
 @app.post("/voice/inbound/start")
 async def inbound_start(req: Request):
-    """True entry point for brand‑new inbound calls."""
     form = await req.form()
     answer = (form.get("SpeechResult") or "").strip()
+    lower = answer.lower()
 
     # Brand‑new empty state
     lead_state = build_lead_state(**{f: "" for f in REQUIRED_FIELDS})
     stage = ""
 
-    # 1) First turn: play branded greeting
+    # 1) First turn greeting
     if not answer:
         vr = VoiceResponse()
         g = Gather(
@@ -965,7 +962,7 @@ async def inbound_start(req: Request):
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 2) Utilities & goodbye detection first
+    # 2) Utilities & goodbye detection
     util = check_utilities(answer, lead_state, current_route="/voice/inbound/start", stage=stage)
     if util:
         return util
@@ -978,12 +975,17 @@ async def inbound_start(req: Request):
     if no_response:
         return no_response
 
-    lower = answer.lower()
-
-    # 4) Booking intent detection
+    # 4) PRICE intent FIRST
+    if any(p in lower for p in ["price", "cost", "how much", "quote"]):
+        return handle_price_intent(
+            answer,
+            lead_state
+        )
+    
+    # 5) Booking intent detection (only if NOT a price question)
     booking_keywords = [
         "book", "appointment", "repair", "fix", "replace",
-        "screen", "battery", "yes", "start", "schedule"
+        "yes", "start", "schedule"
     ]
     if any(word in lower for word in booking_keywords):
         vr = VoiceResponse()
@@ -1000,17 +1002,8 @@ async def inbound_start(req: Request):
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 5) Price intent
-    if "price" in lower or "cost" in lower or "how much" in lower:
-        return repeat_q(
-            "Sure, what device and repair type would you like a price for?",
-            action_path="/voice/outbound/lead/intake",
-            stage="price_lookup",
-            **lead_state
-        )
-
     # 6) Directions intent
-    if "direction" in lower or "where" in lower or "address" in lower or "location" in lower:
+    if any(w in lower for w in ["direction", "where", "address", "location"]):
         vr = VoiceResponse()
         g = Gather(
             input="speech",
@@ -1031,8 +1024,8 @@ async def inbound_start(req: Request):
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 7) General store info intent
-    if "info" in lower or "information" in lower or "store" in lower:
+    # 7) General store info
+    if any(w in lower for w in ["info", "information", "store"]):
         vr = VoiceResponse()
         say_human(
             vr,
@@ -1051,12 +1044,11 @@ async def inbound_start(req: Request):
         vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 8) Catch‑all → friendly message, then AI Q&A
+    # 8) Catch‑all → AI Q&A
     vr = VoiceResponse()
-    say_human(vr, "I’m not sure about that — let me check for you.")
     vr.redirect(f"/voice/inbound/process?{urlencode(lead_state)}")
     return Response(str(vr), media_type="application/xml")
-
+    
 @app.post("/voice/inbound/post_booking_choice")
 async def post_booking_choice(req: Request):
     form = await req.form()
