@@ -780,57 +780,46 @@ async def voice_process(req: Request):
     lower = user_input.lower()
     vr = VoiceResponse()
 
-    # Pull any state passed in
     lead_state = build_lead_state(**{f: req.query_params.get(f, "") for f in REQUIRED_FIELDS})
     stage = req.query_params.get("stage", "")
 
-    # 1) Utilities & goodbye first
+    # Utilities & goodbye first
     util = check_utilities(user_input, lead_state, current_route="/voice/inbound/process", stage=stage)
     if util:
         return util
 
-    # 2) Global YES handling
+    # Global YES/NO handling
     yes_response = handle_yes(user_input, lead_state, stage, current_route="/voice/inbound/process")
     if yes_response:
         return yes_response
-
     no_response = handle_no(user_input, lead_state, stage, current_route="/voice/inbound")
     if no_response:
         return no_response  
 
-    # 3) Price match branch
+    # Price match branch
     repair_keywords = [
         "repair","screen","battery","cracked","broken","device","phone","tablet",
         "hours","address","location","directions","price","quote","appointment"
     ]
     if any(t in lower for t in repair_keywords):
-        spoken = norm_text(lower)
-        for row in lookup_price_rows():
-            dev_norm = norm_text(row.get("Device", ""))
-            rep_norm = norm_text(row.get("RepairType", ""))
-            if not dev_norm or not rep_norm:
-                continue
-            parts = dev_norm.split()
-            tail = " ".join(parts[1:]) if parts and parts[0] in [
-                "samsung","galaxy","apple","iphone","google","pixel"
-            ] else dev_norm
-            if rep_norm in spoken and (dev_norm in spoken or tail in spoken):
-                say_human(vr, f"The current price for {row['Device']} {row['RepairType']} is ${row['Price']}.")
-                return Response(
-                    str(say_and_listen(vr, "Anything else I can help with?")),
-                    media_type="application/xml"
-                )
-        # No match → re‑ask
-        return Response(
-            str(say_and_listen(
-                vr,
-                "Could you tell me the exact device model, like 'Samsung Galaxy S23 Ultra' or 'iPhone 13 Pro'?",
-                action="/voice/inbound/process"
-            )),
-            media_type="application/xml"
-        )
+        match = lookup_price(lower)
+        if match:
+            say_human(vr, f"The current price for {match['Device']} {match['RepairType']} is ${match['Price']}.")
+            return Response(
+                str(say_and_listen(vr, "Anything else I can help with?")),
+                media_type="application/xml"
+            )
+        else:
+            return Response(
+                str(say_and_listen(
+                    vr,
+                    "Could you tell me the exact device model, like 'Samsung Galaxy S23 Ultra' or 'iPhone 13 Pro'?",
+                    action="/voice/inbound/process"
+                )),
+                media_type="application/xml"
+            )
 
-    # 4) Fallback to LLM
+    # Fallback to LLM
     system_prompt = f"""
     You are the receptionist for {STORE_INFO['name']} in {STORE_INFO['city']}.
     Stay strictly on store/services/repairs. Keep answers to 1–3 sentences.
@@ -843,6 +832,7 @@ async def voice_process(req: Request):
     out = openai_client.chat.completions.create(model="gpt-4o-mini", messages=msgs)
     text = out.choices[0].message.content.strip()
     return Response(str(say_and_listen(vr, text)), media_type="application/xml")
+
 
 from datetime import datetime, timedelta
 import pytz
@@ -1049,11 +1039,21 @@ async def inbound_start(req: Request):
             f"We are CPR Cell Phone Repair in Myrtle Beach, located at {STORE_INFO['address']}. "
             f"Our hours are {STORE_INFO['hours']}, and our phone number is {STORE_INFO['phone']}."
         )
-        vr.redirect(f"/voice/inbound/post_booking_choice?{urlencode(lead_state)}")
+        g = Gather(
+            input="speech",
+            action=f"/voice/inbound/post_booking_choice?{urlencode(lead_state)}",
+            method="POST",
+            timeout=20,
+            speech_timeout="auto",
+            speech_model="phone_call"
+        )
+        say_human(g, "Would you like directions or to book a repair?")
+        vr.append(g)
         return Response(str(vr), media_type="application/xml")
 
-    # 8) Catch‑all → send to AI Q&A
+    # 8) Catch‑all → friendly message, then AI Q&A
     vr = VoiceResponse()
+    say_human(vr, "I’m not sure about that — let me check for you.")
     vr.redirect(f"/voice/inbound/process?{urlencode(lead_state)}")
     return Response(str(vr), media_type="application/xml")
 

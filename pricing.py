@@ -1,35 +1,50 @@
-import re
-from sheets import get_price_rows
+import re, os, json, gspread
 
-def _norm(s: str) -> str:
-    return re.sub(r"[^a-z0-9]+", " ", (s or "").lower()).strip()
+def normalize(text):
+    return re.sub(r"[^a-z0-9 ]", "", text.lower()).strip()
 
-def lookup_price(device_raw: str, repair_type_raw: str):
-    dev = _norm(device_raw)
-    rep = _norm(repair_type_raw)
-    for row in get_price_rows():
-        if _norm(row.get("Device","")) == dev and _norm(row.get("RepairType","")) == rep:
-            return {
-                "price": row.get("Price"),
-                "sku": row.get("SKU"),
-                "item_id": row.get("RepairQItemId"),
-                "device": row.get("Device"),
-                "repair_type": row.get("RepairType"),
-            }
+def lookup_price(spoken):
+    spoken_norm = normalize(spoken)
+
+    # Synonym mapping
+    synonyms = {
+        "screen": "screen replacement",
+        "battery": "battery replacement",
+        "charging port": "charging port replacement"
+    }
+    for k, v in synonyms.items():
+        if k in spoken_norm and v not in spoken_norm:
+            spoken_norm = spoken_norm.replace(k, v)
+
+    creds_json = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
+    if not creds_json:
+        print("[WARN] No Google Sheets creds")
+        return None
+
+    creds = gspread.service_account_from_dict(json.loads(creds_json))
+    sheet = creds.open_by_key(os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")).sheet1
+    rows = sheet.get_all_records()
+
+    # Exact-ish match
+    for row in rows:
+        device_norm = normalize(row.get("Device", ""))
+        repair_norm = normalize(row.get("RepairType", ""))
+        if device_norm in spoken_norm and repair_norm in spoken_norm:
+            return row
+
+    # Partial match fallback
+    for row in rows:
+        device_norm = normalize(row.get("Device", ""))
+        if device_norm in spoken_norm:
+            return row
+
     return None
 
 def lookup_price_rows():
-    """
-    Returns ALL price rows from the Google Sheet in normalized dict form.
-    Each row will contain Device, RepairType, Price, SKU, and RepairQItemId keys.
-    """
-    rows_out = []
-    for row in get_price_rows():
-        rows_out.append({
-            "Device": row.get("Device", ""),
-            "RepairType": row.get("RepairType", ""),
-            "Price": row.get("Price"),
-            "SKU": row.get("SKU"),
-            "RepairQItemId": row.get("RepairQItemId")
-        })
-    return rows_out 
+    creds_json = os.getenv("GOOGLE_SHEETS_SERVICE_ACCOUNT_JSON")
+    if not creds_json:
+        print("[WARN] No Google Sheets creds")
+        return []
+    creds = gspread.service_account_from_dict(json.loads(creds_json))
+    sheet = creds.open_by_key(os.getenv("GOOGLE_SHEETS_SPREADSHEET_ID")).sheet1
+    return sheet.get_all_records()
