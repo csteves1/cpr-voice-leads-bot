@@ -16,9 +16,21 @@ from urllib.parse import urlencode
 from openai import OpenAI
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 from urllib.parse import urlencode
-from pricing_helpers import handle_price_intent
 import json
 import gspread
+from pricing_helpers import handle_price_intent as _handle_price_intent
+from shared import lookup_price, lookup_price_rows, gather_booking_choice, STORE_INFO, openai_client
+
+def handle_price_intent(user_input, lead_state):
+    return _handle_price_intent(
+        user_input,
+        lead_state,
+        lookup_price,
+        lookup_price_rows,
+        gather_booking_choice,
+        STORE_INFO,
+        openai_client
+    )
 
 BASE_URL = "https://cpr-voice-leads-bot.onrender.com"  # your Render URL
 
